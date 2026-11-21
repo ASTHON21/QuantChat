@@ -1,0 +1,6 @@
+{
+  "name": "QuantChat",
+  "description": "100% offline on-device GGUF AI chat powered by bundled llama.cpp, Hugging Face model hub downloads, and persistent local conversations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
