@@ -34,8 +34,12 @@ jobs:
       - name: Accept Android SDK licenses
         shell: bash
         run: |
-          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
-            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ -n "$SDK_ROOT" ] && [ -d "$SDK_ROOT/cmdline-tools" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
+            if [ -n "$SDKMANAGER" ]; then
+              yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            fi
           fi
 
       - name: Set up Gradle 9.3.1
@@ -70,18 +74,22 @@ jobs:
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk dist/QuantChat-debug.apk
 
-      - name: Build Signed Release APK (optional if keystore secrets exist)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+      - name: Build Signed Release APK (if keystore secrets exist)
         env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
         shell: bash
         run: |
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > "$KEYSTORE_PATH"
-          gradle :app:assembleRelease --no-daemon
-          cp app/build/outputs/apk/release/app-release.apk dist/QuantChat-release.apk
-          rm -f "$KEYSTORE_PATH"
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+            gradle :app:assembleRelease --no-daemon
+            cp app/build/outputs/apk/release/app-release.apk dist/QuantChat-release.apk
+            rm -f "$KEYSTORE_PATH"
+          else
+            echo "Release keystore secrets not configured; skipping release APK."
+          fi
 
       - name: Upload APK workflow artifact
         uses: actions/upload-artifact@v4
@@ -93,6 +101,8 @@ jobs:
       - name: Publish directly downloadable APK to GitHub Releases
         if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
         uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/') && format('QuantChat {0}', github.ref_name) || 'QuantChat Latest Build' }}
