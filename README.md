@@ -19,13 +19,13 @@ A 100% offline Android GGUF local AI chat application built with Kotlin, Jetpack
 - `app/src/main/java/com/example/ui/screens/` — `ChatsScreen.kt`, `ChatDetailScreen.kt`, `ModelsScreen.kt`
 - `.github/workflows/build-apk.yml` — Automated CI/CD test + APK build + GitHub Release publishing
 
-## Automated APK Builds (GitHub Actions)
+## Automated APK Builds & Releases (GitHub Actions)
 
-Every push to `main`/`master` or `v*` tag automatically runs `.github/workflows/build-apk.yml`:
+App versioning is managed centrally in `version.properties` (`VERSION_NAME`, `VERSION_CODE`) and `CHANGELOG.md`. Every push to `main`/`master` or `v*` tag runs `.github/workflows/build-apk.yml`:
 
 1. Runs JVM/Robolectric unit tests (`gradle :app:testDebugUnitTest`).
-2. Builds `QuantChat-debug.apk` signed for direct Android sideloading.
-3. Publishes the raw `.apk` directly to **GitHub Releases** (`latest` rolling build on branch pushes, or versioned release on `v*` tags) and as a workflow artifact under **Actions**.
+2. Builds `QuantChat-v<VERSION_NAME>-debug.apk` (and `QuantChat-v<VERSION_NAME>-release.apk` if signing secrets exist) with `SHA256SUMS.txt`.
+3. Publishes a formal versioned **GitHub Release** (`v<VERSION_NAME>`, `prerelease: false`, marked as Latest) with notes extracted from `CHANGELOG.md`, build metadata, and commit history.
 
 ### Optional: Signed Release APKs
 

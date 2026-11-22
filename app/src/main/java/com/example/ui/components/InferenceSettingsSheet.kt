@@ -35,6 +35,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.data.AppReleaseInfo
 import com.example.data.InferenceSettings
 import com.example.ui.theme.QuantEmerald
 import com.example.ui.theme.QuantEmeraldContainer
@@ -62,7 +63,8 @@ private val SYSTEM_PROMPT_PRESETS = listOf(
 fun InferenceSettingsSheet(
     currentSettings: InferenceSettings,
     onDismiss: () -> Unit,
-    onApply: (InferenceSettings) -> Unit
+    onApply: (InferenceSettings) -> Unit,
+    onOpenVersionInfo: () -> Unit = {}
 ) {
     var systemPrompt by remember(currentSettings) { mutableStateOf(currentSettings.systemPrompt) }
     var threads by remember(currentSettings) { mutableIntStateOf(currentSettings.threads) }
@@ -254,6 +256,32 @@ fun InferenceSettingsSheet(
                 Text(
                     text = "Apply Runtime Settings",
                     style = QuantTextStyles.LabelLg.copy(fontWeight = FontWeight.SemiBold)
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(QuantSurfaceLowest)
+                    .border(1.dp, QuantSurfaceHigh, RoundedCornerShape(6.dp))
+                    .clickable {
+                        onDismiss()
+                        onOpenVersionInfo()
+                    }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "QuantChat ${AppReleaseInfo.fullVersionLabel} · ${AppReleaseInfo.gitSha}",
+                    style = QuantTextStyles.LabelSm,
+                    color = QuantOutline
+                )
+                Text(
+                    text = "Changelog →",
+                    style = QuantTextStyles.LabelSm.copy(fontWeight = FontWeight.SemiBold),
+                    color = QuantEmerald
                 )
             }
         }

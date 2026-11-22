@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -46,6 +48,21 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
+
+      - name: Resolve Release Version Metadata
+        id: version
+        shell: bash
+        run: |
+          VERSION_NAME=$(grep '^VERSION_NAME=' version.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          VERSION_CODE=$(grep '^VERSION_CODE=' version.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+          else
+            RELEASE_TAG="v${VERSION_NAME}"
+          fi
+          echo "VERSION_NAME=${VERSION_NAME}" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=${RELEASE_TAG}" >> "$GITHUB_ENV"
 
       - name: Generate debug keystore for CI signing
         shell: bash
@@ -72,7 +89,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/QuantChat-debug.apk
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/QuantChat-${RELEASE_TAG}-debug.apk"
 
       - name: Build Signed Release APK (if keystore secrets exist)
         env:
@@ -85,27 +102,94 @@ jobs:
           if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
             echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
             gradle :app:assembleRelease --no-daemon
-            cp app/build/outputs/apk/release/app-release.apk dist/QuantChat-release.apk
+            cp app/build/outputs/apk/release/app-release.apk "dist/QuantChat-${RELEASE_TAG}-release.apk"
             rm -f "$KEYSTORE_PATH"
           else
             echo "Release keystore secrets not configured; skipping release APK."
           fi
 
+      - name: Generate Checksums & Release Notes
+        shell: bash
+        run: |
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          python3 - <<'PY'
+          import os, re, subprocess
+          from pathlib import Path
+
+          ver_name = os.environ["VERSION_NAME"]
+          ver_code = os.environ["VERSION_CODE"]
+          tag = os.environ["RELEASE_TAG"]
+          sha = os.environ.get("GITHUB_SHA", "")[:7]
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+
+          changelog_path = Path("CHANGELOG.md")
+          section = ""
+          if changelog_path.exists():
+              text = changelog_path.read_text(encoding="utf-8")
+              pattern = rf"(## {re.escape(tag)}.*?)(?=\n## v|\Z)"
+              m = re.search(pattern, text, flags=re.S)
+              if m:
+                  section = m.group(1).strip()
+
+          prev_tag = subprocess.run(
+              ["git", "describe", "--tags", "--abbrev=0", "--exclude", tag, "--exclude", "latest"],
+              capture_output=True, text=True
+          ).stdout.strip()
+
+          log_range = f"{prev_tag}..HEAD" if prev_tag else "-n 10"
+          cmd = ["git", "log", "--no-merges", "--pretty=format:- `%h` %s (%an)"]
+          if prev_tag:
+              cmd.append(log_range)
+          else:
+              cmd.extend(["-n", "10"])
+          commits = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+          sums = Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").strip()
+
+          lines = [
+              f"# QuantChat {tag}",
+              "",
+              "| Field | Value |",
+              "|---|---|",
+              f"| Version | `{ver_name}` (Build `{ver_code}`) |",
+              f"| Commit | `{sha}` |",
+              "| Android SDK | Min API 24 / Target API 36 |",
+              "| Native Engine | `llama.cpp` (`llamacpp-kotlin 0.4.0`, `arm64-v8a` / `x86_64`) |",
+              "",
+          ]
+          if section:
+              lines.extend([section, ""])
+          if commits:
+              title = f"### Commits Since `{prev_tag}`" if prev_tag else "### Recent Commits"
+              lines.extend([title, commits, ""])
+          lines.extend(["### SHA-256 Checksums", "```", sums, "```", ""])
+          if repo and prev_tag:
+              lines.append(f"**Compare**: https://github.com/{repo}/compare/{prev_tag}...{tag}")
+
+          Path("dist/RELEASE_NOTES.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
       - name: Upload APK workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: QuantChat-APK
-          path: dist/*.apk
+          name: QuantChat-${{ env.RELEASE_TAG }}-APK
+          path: |
+            dist/*.apk
+            dist/SHA256SUMS.txt
           retention-days: 30
 
-      - name: Publish directly downloadable APK to GitHub Releases
+      - name: Publish Formal Versioned Release to GitHub Releases
         if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/') && format('QuantChat {0}', github.ref_name) || 'QuantChat Latest Build' }}
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          files: dist/*.apk
-          generate_release_notes: true
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: QuantChat ${{ env.RELEASE_TAG }}
+          prerelease: false
+          make_latest: true
+          body_path: dist/RELEASE_NOTES.md
+          generate_release_notes: false
+          files: |
+            dist/*.apk
+            dist/SHA256SUMS.txt

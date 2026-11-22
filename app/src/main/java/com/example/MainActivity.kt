@@ -32,6 +32,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.example.data.ChatThread
+import com.example.ui.components.AppVersionSheet
 import com.example.ui.components.InferenceSettingsSheet
 import com.example.ui.components.QuantBottomNav
 import com.example.ui.components.QuantTab
@@ -96,6 +97,7 @@ fun QuantChatApp(
     val snackbarMessage by viewModel.snackbarMessage.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     var showSettingsSheet by remember { mutableStateOf(false) }
+    var showVersionSheet by remember { mutableStateOf(false) }
 
     val readyLocalFiles = remember(localWeightFiles) {
         localWeightFiles.filter { !it.isPartial }
@@ -171,6 +173,7 @@ fun QuantChatApp(
                         },
                         onDeleteThread = viewModel::deleteThread,
                         onOpenInferenceSettings = { showSettingsSheet = true },
+                        onOpenVersionInfo = { showVersionSheet = true },
                         onGoToModels = { navigateToTab(QuantTab.MODELS) }
                     )
                 }
@@ -262,7 +265,14 @@ fun QuantChatApp(
         InferenceSettingsSheet(
             currentSettings = inferenceSettings,
             onDismiss = { showSettingsSheet = false },
-            onApply = viewModel::updateInferenceSettings
+            onApply = viewModel::updateInferenceSettings,
+            onOpenVersionInfo = { showVersionSheet = true }
+        )
+    }
+
+    if (showVersionSheet) {
+        AppVersionSheet(
+            onDismiss = { showVersionSheet = false }
         )
     }
 }

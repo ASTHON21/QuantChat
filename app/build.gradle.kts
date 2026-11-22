@@ -1,9 +1,18 @@
+import java.util.Properties
+
 plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.kotlin.compose)
   alias(libs.plugins.google.devtools.ksp)
   alias(libs.plugins.secrets)
 }
+
+val versionPropsFile = rootProject.layout.projectDirectory.file("version.properties")
+val versionPropsText = providers.fileContents(versionPropsFile).asText.getOrElse("")
+val versionProps = Properties().apply { load(versionPropsText.reader()) }
+val appVersionName = versionProps.getProperty("VERSION_NAME", "1.1.0").trim()
+val appVersionCode = versionProps.getProperty("VERSION_CODE", "2").trim().toIntOrNull() ?: 2
+val gitShaShort = providers.environmentVariable("GITHUB_SHA").orNull?.take(7) ?: "local"
 
 val robolectricSdk by configurations.creating {
   isCanBeConsumed = false
@@ -26,8 +35,9 @@ android {
     applicationId = "com.aistudio.quantchat.qk7mpx"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = appVersionCode
+    versionName = appVersionName
+    buildConfigField("String", "GIT_SHA", "\"$gitShaShort\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

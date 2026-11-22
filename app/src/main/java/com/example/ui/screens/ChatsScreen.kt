@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -50,6 +51,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
+import com.example.data.AppReleaseInfo
 import com.example.data.ChatThread
 import com.example.data.LocalRuntimeState
 import com.example.data.LocalWeightFile
@@ -78,6 +80,7 @@ fun ChatsScreen(
     onCreateNewChat: () -> Unit,
     onDeleteThread: (String) -> Unit,
     onOpenInferenceSettings: () -> Unit,
+    onOpenVersionInfo: () -> Unit,
     onGoToModels: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -142,6 +145,24 @@ fun ChatsScreen(
                                 .background(QuantSurfaceContainer, RoundedCornerShape(4.dp))
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         )
+                        Box(
+                            modifier = Modifier
+                                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                                .testTag("chats_version_badge")
+                                .clickable(onClick = onOpenVersionInfo),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "v${AppReleaseInfo.versionName}",
+                                style = QuantTextStyles.LabelSm.copy(fontSize = 11.sp),
+                                color = QuantEmerald,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(QuantEmerald.copy(alpha = 0.12f))
+                                    .border(0.8.dp, QuantEmerald.copy(alpha = 0.35f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 7.dp, vertical = 3.dp)
+                            )
+                        }
                     }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
