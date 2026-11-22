@@ -12,6 +12,8 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.Transaction
+import androidx.room.Update
 import com.example.data.ChatMessage
 import com.example.data.ChatRole
 import com.example.data.ChatThread
@@ -66,11 +68,31 @@ interface ChatDao {
     @Query("SELECT * FROM chat_messages WHERE threadId = :threadId ORDER BY timestampMs ASC")
     suspend fun getMessagesForThreadSync(threadId: String): List<ChatMessageEntity>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertThread(thread: ChatThreadEntity)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertThreadIfAbsent(thread: ChatThreadEntity): Long
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertMessage(message: ChatMessageEntity)
+    @Update
+    suspend fun updateThread(thread: ChatThreadEntity)
+
+    @Transaction
+    suspend fun upsertThread(thread: ChatThreadEntity) {
+        if (insertThreadIfAbsent(thread) == -1L) {
+            updateThread(thread)
+        }
+    }
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertMessageIfAbsent(message: ChatMessageEntity): Long
+
+    @Update
+    suspend fun updateMessage(message: ChatMessageEntity)
+
+    @Transaction
+    suspend fun upsertMessage(message: ChatMessageEntity) {
+        if (insertMessageIfAbsent(message) == -1L) {
+            updateMessage(message)
+        }
+    }
 
     @Query("DELETE FROM chat_threads WHERE id = :threadId")
     suspend fun deleteThreadById(threadId: String)

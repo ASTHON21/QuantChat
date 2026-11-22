@@ -11,6 +11,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.nehuatl.llamacpp.LlamaAndroid
 import java.io.File
@@ -21,6 +23,8 @@ private const val TAG = "LocalLlamaRepo"
 class LocalLlamaRepository(context: Context) {
 
     private val llama = LlamaAndroid(context.contentResolver)
+    private val engineMutex = Mutex()
+    private val tokenLock = Any()
 
     @Volatile
     private var activeContextId: Int? = null
@@ -36,44 +40,49 @@ class LocalLlamaRepository(context: Context) {
         diskFile: File,
         settings: InferenceSettings
     ): Int = withContext(Dispatchers.IO) {
-        unloadModel()
+        engineMutex.withLock {
+            unloadModelLocked()
 
-        if (!diskFile.exists() || diskFile.length() < 1024L) {
-            throw IllegalStateException("Model file ${weightFile.displayFileName} is missing or incomplete.")
+            if (!diskFile.exists() || diskFile.length() < 1024L) {
+                throw IllegalStateException("Model file ${weightFile.displayFileName} is missing or incomplete.")
+            }
+
+            val uri = Uri.fromFile(diskFile)
+            val validGguf = runCatching { llama.isGGUF(uri) }.getOrDefault(false)
+            if (!validGguf) {
+                throw IllegalArgumentException("${weightFile.displayFileName} failed GGUF magic header verification.")
+            }
+
+            val pfd = ParcelFileDescriptor.open(diskFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            val fd = pfd.detachFd()
+
+            val engineParams = mapOf<String, Any>(
+                "model" to uri.toString(),
+                "model_fd" to fd,
+                "n_ctx" to settings.contextSize,
+                "n_batch" to 512,
+                "n_threads" to settings.threads,
+                "n_gpu_layers" to 0,
+                "use_mmap" to true,
+                "use_mlock" to false,
+                "embedding" to false
+            )
+
+            val result = llama.startEngine(engineParams) { tokenChunk ->
+                activeTokenSink?.invoke(tokenChunk)
+            } ?: run {
+                runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+                throw IllegalStateException(
+                    "Native llama.cpp failed to initialize ${weightFile.displayFileName}. Verify device RAM and 64-bit ABI support."
+                )
+            }
+
+            val ctxId = (result["contextId"] as? Int)
+                ?: throw IllegalStateException("Native engine returned an invalid context ID.")
+            activeContextId = ctxId
+            Log.d(TAG, "Loaded ${weightFile.displayFileName} into native contextId=$ctxId (n_ctx=${settings.contextSize}, threads=${settings.threads})")
+            ctxId
         }
-
-        val uri = Uri.fromFile(diskFile)
-        val validGguf = runCatching { llama.isGGUF(uri) }.getOrDefault(false)
-        if (!validGguf) {
-            throw IllegalArgumentException("${weightFile.displayFileName} failed GGUF magic header verification.")
-        }
-
-        val pfd = ParcelFileDescriptor.open(diskFile, ParcelFileDescriptor.MODE_READ_ONLY)
-        val fd = pfd.detachFd()
-
-        val engineParams = mapOf<String, Any>(
-            "model" to uri.toString(),
-            "model_fd" to fd,
-            "n_ctx" to settings.contextSize,
-            "n_batch" to 512,
-            "n_threads" to settings.threads,
-            "n_gpu_layers" to 0,
-            "use_mmap" to true,
-            "use_mlock" to false,
-            "embedding" to false
-        )
-
-        val result = llama.startEngine(engineParams) { tokenChunk ->
-            activeTokenSink?.invoke(tokenChunk)
-        } ?: throw IllegalStateException(
-            "Native llama.cpp failed to initialize ${weightFile.displayFileName}. Verify device RAM and 64-bit ABI support."
-        )
-
-        val ctxId = (result["contextId"] as? Int)
-            ?: throw IllegalStateException("Native engine returned an invalid context ID.")
-        activeContextId = ctxId
-        Log.d(TAG, "Loaded ${weightFile.displayFileName} into native contextId=$ctxId (n_ctx=${settings.contextSize}, threads=${settings.threads})")
-        ctxId
     }
 
     fun streamCompletion(
@@ -90,10 +99,12 @@ class LocalLlamaRepository(context: Context) {
 
         activeTokenSink = { chunk ->
             if (chunk.isNotEmpty()) {
-                chunkCount++
-                accumulated.append(chunk)
-                val cleaned = stripControlTokens(accumulated.toString())
-                trySend(LocalStreamEvent.Delta(accumulatedText = cleaned, tokenCount = chunkCount))
+                val (cleaned, count) = synchronized(tokenLock) {
+                    chunkCount++
+                    accumulated.append(chunk)
+                    stripControlTokens(accumulated.toString()) to chunkCount
+                }
+                trySend(LocalStreamEvent.Delta(accumulatedText = cleaned, tokenCount = count))
             }
         }
 
@@ -116,15 +127,35 @@ class LocalLlamaRepository(context: Context) {
                     "top_p" to 0.92,
                     "min_p" to 0.05,
                     "penalty_repeat" to 1.1,
+                    "emit_partial_completion" to true,
                     "stop" to STOP_TOKENS
                 )
 
-                llama.launchCompletion(contextId, completionParams)
+                val completionResult = engineMutex.withLock {
+                    if (activeContextId != contextId) {
+                        throw IllegalStateException("Local model context was unloaded before inference started.")
+                    }
+                    llama.launchCompletion(contextId, completionParams)
+                }
 
                 val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
-                val finalText = stripControlTokens(accumulated.toString()).trim()
-                val tokPerSec = if (chunkCount > 0) {
-                    (chunkCount * 1000f) / elapsed.toFloat()
+                val (streamedRaw, streamedCount) = synchronized(tokenLock) {
+                    accumulated.toString() to chunkCount
+                }
+
+                if (completionResult == null && streamedRaw.isBlank() && !stopRequested) {
+                    throw IllegalStateException(
+                        "Local llama.cpp completion failed for ${weightFile.displayFileName}. Try reducing context size or reloading the model."
+                    )
+                }
+
+                val resultText = (completionResult?.get("text") as? String).orEmpty()
+                val rawFinal = streamedRaw.ifBlank { resultText }
+                val finalText = stripControlTokens(rawFinal).trim()
+                val predictedCount = (completionResult?.get("tokens_predicted") as? Number)?.toInt() ?: 0
+                val effectiveTokens = maxOf(streamedCount, predictedCount)
+                val tokPerSec = if (effectiveTokens > 0) {
+                    (effectiveTokens * 1000f) / elapsed.toFloat()
                 } else 0f
 
                 send(
@@ -133,7 +164,7 @@ class LocalLlamaRepository(context: Context) {
                             if (stopRequested) "[Generation stopped]" else "(Empty response from local model)"
                         },
                         elapsedMs = elapsed,
-                        tokenCount = chunkCount,
+                        tokenCount = effectiveTokens,
                         tokensPerSecond = tokPerSec,
                         wasStopped = stopRequested
                     )
@@ -167,16 +198,22 @@ class LocalLlamaRepository(context: Context) {
     }
 
     suspend fun unloadModel() {
+        withContext(Dispatchers.IO) {
+            engineMutex.withLock {
+                unloadModelLocked()
+            }
+        }
+    }
+
+    private suspend fun unloadModelLocked() {
         val ctxId = activeContextId
         activeContextId = null
         activeTokenSink = null
         if (ctxId != null) {
-            withContext(Dispatchers.IO) {
-                runCatching {
-                    llama.stopCompletion(ctxId)
-                    llama.releaseContext(ctxId)
-                }.onFailure { Log.w(TAG, "releaseContext warning", it) }
-            }
+            runCatching {
+                llama.stopCompletion(ctxId)
+                llama.releaseContext(ctxId)
+            }.onFailure { Log.w(TAG, "releaseContext warning", it) }
         }
     }
 
@@ -286,6 +323,7 @@ class LocalLlamaRepository(context: Context) {
         private val STOP_TOKENS = listOf(
             "<|im_end|>",
             "<|im_start|>",
+            "<|endoftext|>",
             "<end_of_turn>",
             "<|end|>",
             "<|eot_id|>",

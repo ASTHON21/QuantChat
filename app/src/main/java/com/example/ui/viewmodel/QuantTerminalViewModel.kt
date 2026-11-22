@@ -204,9 +204,6 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
             _snackbarMessage.value = "Cannot load incomplete .part file. Resume download first."
             return
         }
-        if (_isGenerating.value) {
-            stopGeneration()
-        }
         val diskFile = hfRepository.resolveLocalFile(file.diskFileName)
         if (diskFile == null) {
             _runtimeState.value = LocalRuntimeState.Error(file, "Weight file not found on device storage.")
@@ -216,6 +213,10 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
 
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
+            if (_isGenerating.value || generationJob?.isActive == true) {
+                llamaRepository.stopGeneration()
+                generationJob?.join()
+            }
             _runtimeState.value = LocalRuntimeState.Loading(file)
             try {
                 val settings = _inferenceSettings.value
@@ -247,10 +248,11 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
 
     fun unloadLocalModel() {
         loadJob?.cancel()
-        if (_isGenerating.value) {
-            stopGeneration()
-        }
         viewModelScope.launch {
+            if (_isGenerating.value || generationJob?.isActive == true) {
+                llamaRepository.stopGeneration()
+                generationJob?.join()
+            }
             llamaRepository.unloadModel()
             _runtimeState.value = LocalRuntimeState.Unloaded("Model unloaded from memory.")
             hfRepository.saveLastLoadedModel(null)
@@ -358,7 +360,6 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                                 isStreaming = false,
                                 isError = false
                             )
-                            _streamingMessage.value = null
                             chatRepository.upsertMessage(finalMsg)
                             chatRepository.upsertThread(
                                 ChatThread(
@@ -370,6 +371,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                                     timestampLabel = ChatRepository.formatTimestamp(completedAt)
                                 )
                             )
+                            _streamingMessage.value = null
                         }
                     }
                 }
@@ -379,19 +381,30 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
             } catch (e: Exception) {
                 Log.e(TAG, "Local llama.cpp generation failed", e)
                 val errAt = System.currentTimeMillis()
+                val errText = e.localizedMessage ?: "Local GGUF inference failed."
                 val errMsg = ChatMessage(
                     id = "err_${UUID.randomUUID().toString().take(8)}",
                     threadId = threadId,
                     role = ChatRole.ASSISTANT,
-                    text = e.localizedMessage ?: "Local GGUF inference failed.",
+                    text = errText,
                     modelLabel = readyState.file.displayFileName,
                     timestampMs = errAt,
                     timestampLabel = ChatRepository.formatTimestamp(errAt),
                     isStreaming = false,
                     isError = true
                 )
-                _streamingMessage.value = null
                 chatRepository.upsertMessage(errMsg)
+                chatRepository.upsertThread(
+                    ChatThread(
+                        id = threadId,
+                        title = updatedTitle,
+                        preview = errText.replace('\n', ' ').take(90),
+                        modelFileName = readyState.file.displayFileName,
+                        updatedAtMs = errAt,
+                        timestampLabel = ChatRepository.formatTimestamp(errAt)
+                    )
+                )
+                _streamingMessage.value = null
             } finally {
                 _streamingMessage.value = null
                 _isGenerating.value = false

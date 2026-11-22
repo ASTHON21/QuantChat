@@ -117,7 +117,10 @@ fun ChatDetailScreen(
     val clipboardManager = LocalClipboardManager.current
 
     val combinedMessages = remember(messages, streamingMessage, thread.id) {
-        if (streamingMessage != null && streamingMessage.threadId == thread.id) {
+        if (streamingMessage != null &&
+            streamingMessage.threadId == thread.id &&
+            messages.none { it.id == streamingMessage.id }
+        ) {
             messages + streamingMessage
         } else {
             messages
@@ -750,7 +753,7 @@ private fun AssistantChatBubble(
                     modifier = Modifier.weight(1f).padding(end = 8.dp)
                 )
                 val statsLabel = when {
-                    message.isStreaming -> "streaming..."
+                    message.isStreaming -> if ((message.tokenCount ?: 0) > 0) "streaming · ${message.tokenCount} tok" else "streaming..."
                     message.tokensPerSec != null && message.latencyMs != null && message.tokensPerSec > 0f ->
                         String.format(Locale.US, "%.1f tok/s · %dms", message.tokensPerSec, message.latencyMs)
                     message.latencyMs != null -> "${message.latencyMs}ms"
