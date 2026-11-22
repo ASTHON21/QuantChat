@@ -5,6 +5,19 @@ plugins {
   alias(libs.plugins.secrets)
 }
 
+val robolectricSdk by configurations.creating {
+  isCanBeConsumed = false
+  isCanBeResolved = true
+  isTransitive = false
+}
+
+val robolectricSdkDir = layout.buildDirectory.dir("robolectric-sdk")
+
+val prepareRobolectricSdk by tasks.registering(Sync::class) {
+  from(robolectricSdk)
+  into(robolectricSdkDir)
+}
+
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
@@ -60,7 +73,16 @@ android {
     compose = true
     buildConfig = true
   }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+      all {
+        it.dependsOn(prepareRobolectricSdk)
+        it.systemProperty("robolectric.offline", "true")
+        it.systemProperty("robolectric.dependency.dir", robolectricSdkDir.get().asFile.absolutePath)
+      }
+    }
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
@@ -114,6 +136,7 @@ dependencies {
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
   testImplementation(libs.robolectric)
+  robolectricSdk("org.robolectric:android-all-instrumented:16-robolectric-13921718-i7")
   androidTestImplementation(platform(libs.androidx.compose.bom))
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
   androidTestImplementation(libs.androidx.espresso.core)
