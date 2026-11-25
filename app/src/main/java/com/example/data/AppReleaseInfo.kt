@@ -19,10 +19,22 @@ object AppReleaseInfo {
 
     val changelog: List<ReleaseChangelogEntry> = listOf(
         ReleaseChangelogEntry(
+            version = "v1.2.0",
+            buildNumber = 3,
+            date = "2026-11-25",
+            badge = "CURRENT",
+            highlights = listOf(
+                "Refactored runtime into 8 decoupled Gradle modules with unified InferenceBackend contracts and EngineLifecycleState.",
+                "Added real Android CPU SIMD/cluster topology, free RAM admission, thermal monitoring, and hardware Run Bench diagnostics.",
+                "Added binary GGUF header metadata parser, token context budgeting, and per-thread KV-cache session persistence.",
+                "Established loopback OpenAI router module and Android Share / Process Text local prompt integration."
+            )
+        ),
+        ReleaseChangelogEntry(
             version = "v1.1.0",
             buildNumber = 2,
             date = "2026-11-22",
-            badge = "CURRENT",
+            badge = "RELEASED",
             highlights = listOf(
                 "Enabled llama.cpp partial token streaming so responses appear token-by-token instead of stalling on CPU prompt evaluation.",
                 "Fixed Room foreign-key cascade bug where updating thread metadata wiped existing chat messages.",

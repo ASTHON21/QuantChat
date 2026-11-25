@@ -1,11 +1,13 @@
 package com.example
 
+import android.content.Intent
 import android.graphics.Color as AndroidColor
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -32,6 +34,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.example.data.ChatThread
+import com.example.data.LocalRuntimeState
 import com.example.ui.components.AppVersionSheet
 import com.example.ui.components.InferenceSettingsSheet
 import com.example.ui.components.QuantBottomNav
@@ -44,12 +47,16 @@ import com.example.ui.theme.QuantEmerald
 import com.example.ui.theme.QuantOnSurface
 import com.example.ui.theme.QuantSurface
 import com.example.ui.theme.QuantSurfaceHigh
+import com.example.ui.viewmodel.PendingExternalNavigation
 import com.example.ui.viewmodel.QuantTerminalViewModel
 import kotlinx.coroutines.launch
 
 const val ROUTE_CHAT_DETAIL = "chat/{threadId}"
 
 class MainActivity : ComponentActivity() {
+
+    private val terminalViewModel: QuantTerminalViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -58,11 +65,21 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
         )
 
+        if (savedInstanceState == null) {
+            terminalViewModel.handleLaunchIntent(intent)
+        }
+
         setContent {
             QuantChatTheme {
-                QuantChatApp()
+                QuantChatApp(viewModel = terminalViewModel)
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        terminalViewModel.handleLaunchIntent(intent)
     }
 }
 
@@ -82,6 +99,8 @@ fun QuantChatApp(
     val runtimeState by viewModel.runtimeState.collectAsStateWithLifecycle()
     val inferenceSettings by viewModel.inferenceSettings.collectAsStateWithLifecycle()
     val isGenerating by viewModel.isGenerating.collectAsStateWithLifecycle()
+    val orchestratorSnapshot by viewModel.orchestratorSnapshot.collectAsStateWithLifecycle()
+    val pendingExternalNav by viewModel.pendingExternalNavigation.collectAsStateWithLifecycle()
 
     val curatedModels by viewModel.curatedModels.collectAsStateWithLifecycle()
     val selectedModelTab by viewModel.selectedModelTab.collectAsStateWithLifecycle()
@@ -98,17 +117,10 @@ fun QuantChatApp(
     val snackbarHostState = remember { SnackbarHostState() }
     var showSettingsSheet by remember { mutableStateOf(false) }
     var showVersionSheet by remember { mutableStateOf(false) }
+    var activeDraftText by remember { mutableStateOf<String?>(null) }
 
     val readyLocalFiles = remember(localWeightFiles) {
         localWeightFiles.filter { !it.isPartial }
-    }
-
-    LaunchedEffect(snackbarMessage) {
-        val msg = snackbarMessage
-        if (msg != null) {
-            snackbarHostState.showSnackbar(msg)
-            viewModel.clearSnackbar()
-        }
     }
 
     fun navigateToTab(tab: QuantTab) {
@@ -118,6 +130,29 @@ fun QuantChatApp(
             }
             launchSingleTop = true
             restoreState = true
+        }
+    }
+
+    LaunchedEffect(pendingExternalNav) {
+        when (val nav = pendingExternalNav) {
+            is PendingExternalNavigation.OpenChatWithDraft -> {
+                activeDraftText = nav.prefillText
+                navController.navigate("chat/${nav.threadId}")
+                viewModel.consumeExternalNavigation()
+            }
+            is PendingExternalNavigation.OpenModelsTab -> {
+                navigateToTab(QuantTab.MODELS)
+                viewModel.consumeExternalNavigation()
+            }
+            null -> Unit
+        }
+    }
+
+    LaunchedEffect(snackbarMessage) {
+        val msg = snackbarMessage
+        if (msg != null) {
+            snackbarHostState.showSnackbar(msg)
+            viewModel.clearSnackbar()
         }
     }
 
@@ -239,6 +274,9 @@ fun QuantChatApp(
                         readyLocalFiles = readyLocalFiles,
                         inferenceSettings = inferenceSettings,
                         isGenerating = isGenerating,
+                        orchestratorSnapshot = orchestratorSnapshot,
+                        initialDraftText = activeDraftText,
+                        onDraftConsumed = { activeDraftText = null },
                         onBack = { navController.popBackStack() },
                         onLoadLocalModel = viewModel::loadLocalModel,
                         onUnloadLocalModel = viewModel::unloadLocalModel,
@@ -264,6 +302,10 @@ fun QuantChatApp(
     if (showSettingsSheet) {
         InferenceSettingsSheet(
             currentSettings = inferenceSettings,
+            orchestratorSnapshot = orchestratorSnapshot,
+            isModelReady = runtimeState is LocalRuntimeState.Ready,
+            onRefreshDiagnostics = viewModel::refreshHardwareDiagnostics,
+            onRunBenchmark = viewModel::runHardwareBenchmark,
             onDismiss = { showSettingsSheet = false },
             onApply = viewModel::updateInferenceSettings,
             onOpenVersionInfo = { showVersionSheet = true }

@@ -1,5 +1,9 @@
 package com.example.data
 
+import com.quantchat.engine.core.EngineModelDetails
+import com.quantchat.model.GgufHeaderMetadata
+import com.quantchat.resource.AdmissionAssessment
+
 // --- Local Chat & Persistence Models ---
 
 enum class ChatRole(val raw: String) {
@@ -59,7 +63,9 @@ sealed interface LocalRuntimeState {
         val file: LocalWeightFile,
         val contextId: Int,
         val contextSize: Int,
-        val threads: Int
+        val threads: Int,
+        val modelDetails: EngineModelDetails? = null,
+        val headerMetadata: GgufHeaderMetadata? = null
     ) : LocalRuntimeState
     data class Error(val file: LocalWeightFile?, val message: String) : LocalRuntimeState
 }
@@ -145,7 +151,9 @@ data class LocalWeightFile(
     val repoId: String,
     val sizeBytes: Long,
     val isPartial: Boolean,
-    val downloadUrl: String? = null
+    val downloadUrl: String? = null,
+    val headerMetadata: GgufHeaderMetadata? = null,
+    val admission: AdmissionAssessment? = null
 ) {
     val quantTag: String
         get() {

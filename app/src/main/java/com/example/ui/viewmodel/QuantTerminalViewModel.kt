@@ -1,6 +1,7 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.content.Intent
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -20,13 +21,29 @@ import com.example.data.HubModelTab
 import com.example.data.HubSearchUiState
 import com.example.data.HuggingFaceModelRepository
 import com.example.data.InferenceSettings
-import com.example.data.LocalLlamaRepository
 import com.example.data.LocalRuntimeState
-import com.example.data.LocalStreamEvent
 import com.example.data.LocalWeightFile
 import com.example.data.ModelFileArtifact
 import com.example.data.local.AppChatDatabase
 import com.example.data.local.ChatRepository
+import com.quantchat.engine.core.ChatTurn
+import com.quantchat.engine.core.EngineError
+import com.quantchat.engine.core.GenerationEvent
+import com.quantchat.engine.core.InferenceBackend
+import com.quantchat.engine.core.ModelId
+import com.quantchat.engine.llamacpp.LlamaCppBackend
+import com.quantchat.hardware.HardwareCapabilityManager
+import com.quantchat.integration.LaunchAction
+import com.quantchat.integration.SystemIntegrationBridge
+import com.quantchat.model.LocalModelRegistry
+import com.quantchat.resource.AdmissionVerdict
+import com.quantchat.resource.OrchestratorSnapshot
+import com.quantchat.resource.RuntimeOrchestrator
+import com.quantchat.resource.RuntimeResourceManager
+import com.quantchat.server.LocalHttpServer
+import com.quantchat.server.LocalOpenAiRouter
+import com.quantchat.server.LocalServerState
+import com.quantchat.session.SessionCacheManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -40,18 +57,48 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.Locale
 import java.util.UUID
 
 private const val TAG = "QuantTerminalVM"
 
+sealed interface PendingExternalNavigation {
+    data class OpenChatWithDraft(
+        val threadId: String,
+        val prefillText: String,
+        val sourceLabel: String
+    ) : PendingExternalNavigation
+
+    data object OpenModelsTab : PendingExternalNavigation
+}
+
 class QuantTerminalViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val hfRepository = HuggingFaceModelRepository(application.applicationContext)
-    private val llamaRepository = LocalLlamaRepository(application.applicationContext)
+    private val appContext = application.applicationContext
+    private val hfRepository = HuggingFaceModelRepository(appContext)
     private val chatRepository = ChatRepository(
-        AppChatDatabase.getInstance(application.applicationContext).chatDao()
+        AppChatDatabase.getInstance(appContext).chatDao()
     )
+
+    private val inferenceBackend: InferenceBackend = LlamaCppBackend(appContext.contentResolver)
+    private val hardwareManager = HardwareCapabilityManager(appContext)
+    private val resourceManager = RuntimeResourceManager(hardwareManager)
+    private val modelRegistry = LocalModelRegistry(hfRepository.modelsDirectory)
+    private val sessionManager = SessionCacheManager(File(appContext.filesDir, "sessions"))
+
+    private val orchestrator = RuntimeOrchestrator(
+        backend = inferenceBackend,
+        hardwareManager = hardwareManager,
+        resourceManager = resourceManager,
+        modelRegistry = modelRegistry,
+        sessionManager = sessionManager
+    )
+
+    private val localHttpServer = LocalHttpServer(LocalOpenAiRouter(inferenceBackend))
+
+    val orchestratorSnapshot: StateFlow<OrchestratorSnapshot> = orchestrator.snapshot
+    val localServerState: StateFlow<LocalServerState> = localHttpServer.state
 
     val threads: StateFlow<List<ChatThread>> = chatRepository.allThreads
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -108,11 +155,18 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
     private val _snackbarMessage = MutableStateFlow<String?>(null)
     val snackbarMessage: StateFlow<String?> = _snackbarMessage.asStateFlow()
 
+    private val _pendingExternalNavigation = MutableStateFlow<PendingExternalNavigation?>(null)
+    val pendingExternalNavigation: StateFlow<PendingExternalNavigation?> = _pendingExternalNavigation.asStateFlow()
+
     private var downloadJob: Job? = null
     private var loadJob: Job? = null
     private var generationJob: Job? = null
+    private var metadataJob: Job? = null
 
     init {
+        viewModelScope.launch {
+            orchestrator.initialize()
+        }
         viewModelScope.launch {
             hfRepository.hfTokenFlow.collect { token ->
                 _hfAuthState.value = HfAuthState(token = token, isLoaded = true)
@@ -137,9 +191,87 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    fun handleLaunchIntent(intent: Intent?) {
+        when (val action = SystemIntegrationBridge.parseLaunchIntent(intent)) {
+            is LaunchAction.PrefillSharedPrompt -> {
+                viewModelScope.launch {
+                    val threadId = createNewThreadImmediate()
+                    _pendingExternalNavigation.value = PendingExternalNavigation.OpenChatWithDraft(
+                        threadId = threadId,
+                        prefillText = action.text,
+                        sourceLabel = action.sourceLabel
+                    )
+                    _snackbarMessage.value = "Imported text from ${action.sourceLabel} into local draft."
+                }
+            }
+
+            is LaunchAction.OpenModelsTab -> {
+                _pendingExternalNavigation.value = PendingExternalNavigation.OpenModelsTab
+            }
+
+            LaunchAction.None -> Unit
+        }
+    }
+
+    fun consumeExternalNavigation() {
+        _pendingExternalNavigation.value = null
+    }
+
+    fun refreshHardwareDiagnostics() {
+        viewModelScope.launch {
+            orchestrator.refreshDiagnostics()
+        }
+    }
+
+    fun runHardwareBenchmark() {
+        if (_isGenerating.value) {
+            _snackbarMessage.value = "Wait for active generation to finish before benchmarking."
+            return
+        }
+        if (_runtimeState.value !is LocalRuntimeState.Ready) {
+            _snackbarMessage.value = "Load a local GGUF model first to benchmark real hardware throughput."
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val result = orchestrator.runBenchmark()
+                _snackbarMessage.value = String.format(
+                    Locale.US,
+                    "Benchmark complete: PP %.1f tok/s · TG %.1f tok/s",
+                    result.prefillTokensPerSec,
+                    result.decodeTokensPerSec
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Benchmark failed", e)
+                _snackbarMessage.value = e.localizedMessage ?: "Hardware benchmark failed."
+            }
+        }
+    }
+
     fun refreshLocalWeights() {
-        _localWeightFiles.value = hfRepository.listLocalWeightFiles()
+        val baseFiles = hfRepository.listLocalWeightFiles()
+        _localWeightFiles.value = baseFiles
         _isOnline.value = hfRepository.isNetworkConnected()
+
+        metadataJob?.cancel()
+        metadataJob = viewModelScope.launch {
+            val ctxSize = _inferenceSettings.value.contextSize
+            val enriched = baseFiles.map { file ->
+                if (file.isPartial) {
+                    file
+                } else {
+                    val diskFile = hfRepository.resolveLocalFile(file.diskFileName)
+                    val header = orchestrator.inspectModelMetadata(file.diskFileName)
+                    val admission = diskFile?.let {
+                        orchestrator.assessAdmission(it, header, ctxSize)
+                    }
+                    file.copy(headerMetadata = header, admission = admission)
+                }
+            }
+            _localWeightFiles.value = enriched
+        }
     }
 
     fun clearSnackbar() {
@@ -173,6 +305,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
             if (_streamingMessage.value?.threadId == threadId) {
                 stopGeneration()
             }
+            orchestrator.invalidateThreadSession(threadId)
             chatRepository.deleteThread(threadId)
             _snackbarMessage.value = "Conversation deleted."
         }
@@ -183,6 +316,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
             if (_streamingMessage.value?.threadId == threadId) {
                 stopGeneration()
             }
+            orchestrator.invalidateThreadSession(threadId)
             chatRepository.clearThreadMessages(threadId)
             val existing = threads.value.firstOrNull { it.id == threadId } ?: return@launch
             val now = System.currentTimeMillis()
@@ -214,27 +348,45 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
             if (_isGenerating.value || generationJob?.isActive == true) {
-                llamaRepository.stopGeneration()
+                orchestrator.stopGeneration()
                 generationJob?.join()
             }
             _runtimeState.value = LocalRuntimeState.Loading(file)
             try {
                 val settings = _inferenceSettings.value
-                val contextId = llamaRepository.loadModel(
-                    weightFile = file,
+                val outcome = orchestrator.loadModel(
+                    modelId = ModelId(file.diskFileName),
+                    displayName = file.displayFileName,
                     diskFile = diskFile,
-                    settings = settings
-                )
-                _runtimeState.value = LocalRuntimeState.Ready(
-                    file = file,
-                    contextId = contextId,
                     contextSize = settings.contextSize,
                     threads = settings.threads
                 )
+                _runtimeState.value = LocalRuntimeState.Ready(
+                    file = file.copy(
+                        headerMetadata = outcome.headerMetadata,
+                        admission = outcome.admission
+                    ),
+                    contextId = outcome.readyState.contextId,
+                    contextSize = settings.contextSize,
+                    threads = settings.threads,
+                    modelDetails = outcome.readyState.modelDetails,
+                    headerMetadata = outcome.headerMetadata
+                )
                 hfRepository.saveLastLoadedModel(file.diskFileName)
-                _snackbarMessage.value = "Loaded ${file.displayFileName} into offline runtime."
+                _snackbarMessage.value = if (outcome.admission.verdict == AdmissionVerdict.WARNING) {
+                    "Loaded ${file.displayFileName} (${outcome.admission.summary})"
+                } else {
+                    "Loaded ${file.displayFileName} into offline runtime."
+                }
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: EngineError) {
+                Log.e(TAG, "EngineError loading local GGUF model", e)
+                _runtimeState.value = LocalRuntimeState.Error(
+                    file = file,
+                    message = e.message
+                )
+                _snackbarMessage.value = "Failed to load ${file.displayFileName}."
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load local GGUF model", e)
                 _runtimeState.value = LocalRuntimeState.Error(
@@ -250,10 +402,10 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         loadJob?.cancel()
         viewModelScope.launch {
             if (_isGenerating.value || generationJob?.isActive == true) {
-                llamaRepository.stopGeneration()
+                orchestrator.stopGeneration()
                 generationJob?.join()
             }
-            llamaRepository.unloadModel()
+            orchestrator.unloadModel()
             _runtimeState.value = LocalRuntimeState.Unloaded("Model unloaded from memory.")
             hfRepository.saveLastLoadedModel(null)
             _snackbarMessage.value = "Unloaded local model to free RAM."
@@ -262,7 +414,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
 
     fun stopGeneration() {
         viewModelScope.launch {
-            llamaRepository.stopGeneration()
+            orchestrator.stopGeneration()
         }
     }
 
@@ -299,6 +451,8 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         generationJob = viewModelScope.launch {
             try {
                 val priorHistory = chatRepository.getRecentMessagesSync(threadId)
+                    .filter { !it.isError && it.text.isNotBlank() }
+                    .map { ChatTurn(role = it.role.raw, content = it.text) }
 
                 chatRepository.upsertThread(
                     ChatThread(
@@ -326,15 +480,20 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                 )
 
                 val settings = _inferenceSettings.value
-                llamaRepository.streamCompletion(
-                    contextId = readyState.contextId,
-                    weightFile = readyState.file,
+                val modelFamilyHint = "${readyState.file.repoId} ${readyState.file.displayFileName}"
+                orchestrator.streamChat(
+                    threadId = threadId,
+                    modelId = ModelId(readyState.file.diskFileName),
+                    systemPrompt = settings.systemPrompt,
                     history = priorHistory,
                     userPrompt = promptText,
-                    settings = settings
+                    modelFamilyHint = modelFamilyHint,
+                    contextSize = settings.contextSize,
+                    maxTokens = settings.maxTokens,
+                    temperature = settings.temperature
                 ).collect { event ->
                     when (event) {
-                        is LocalStreamEvent.Delta -> {
+                        is GenerationEvent.TokenDelta -> {
                             _streamingMessage.update { current ->
                                 current?.copy(
                                     text = event.accumulatedText,
@@ -344,7 +503,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                             }
                         }
 
-                        is LocalStreamEvent.Completed -> {
+                        is GenerationEvent.Completed -> {
                             val completedAt = System.currentTimeMillis()
                             val finalMsg = ChatMessage(
                                 id = aiMsgId,
@@ -408,6 +567,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
             } finally {
                 _streamingMessage.value = null
                 _isGenerating.value = false
+                orchestrator.syncBackendState()
             }
         }
     }
@@ -418,6 +578,9 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
             hfRepository.saveInferenceSettings(newSettings)
             val needsReload = (oldSettings.threads != newSettings.threads ||
                 oldSettings.contextSize != newSettings.contextSize)
+            if (needsReload || oldSettings.systemPrompt != newSettings.systemPrompt) {
+                sessionManager.invalidateAll()
+            }
             val ready = _runtimeState.value as? LocalRuntimeState.Ready
             if (needsReload && ready != null) {
                 loadLocalModel(ready.file)
@@ -431,6 +594,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                     newSettings.temperature
                 )
             }
+            refreshLocalWeights()
         }
     }
 
@@ -707,9 +871,9 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
             if (isCurrentlyLoaded) {
                 loadJob?.cancel()
                 if (_isGenerating.value) {
-                    llamaRepository.stopGeneration()
+                    orchestrator.stopGeneration()
                 }
-                llamaRepository.unloadModel()
+                orchestrator.unloadModel()
                 _runtimeState.value = LocalRuntimeState.Unloaded()
                 hfRepository.saveLastLoadedModel(null)
             }
@@ -736,9 +900,11 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         downloadJob?.cancel()
         loadJob?.cancel()
         generationJob?.cancel()
+        metadataJob?.cancel()
         hfRepository.cancelActiveHttpCall()
+        localHttpServer.stop()
         CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
-            llamaRepository.unloadModel()
+            orchestrator.unloadModel()
         }
     }
 }

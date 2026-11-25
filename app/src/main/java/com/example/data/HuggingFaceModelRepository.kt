@@ -63,6 +63,9 @@ class HuggingFaceModelRepository(private val context: Context) {
             if (!exists()) mkdirs()
         }
 
+    val modelsDirectory: File
+        get() = modelsDir
+
     @Volatile
     private var activeCall: Call? = null
 

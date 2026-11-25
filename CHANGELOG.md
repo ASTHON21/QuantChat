@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.0 (Build 3) - 2026-11-25
+
+### Phase 0: Core Runtime Architecture & Native Probing
+- **8-Module Architecture Decoupling**: Split inference contracts (`engine-core`), `llama.cpp` JNI adapter (`engine-llamacpp`), hardware probing (`hardware-manager`), RAM/thermal/thread scheduling (`resource-manager`), GGUF metadata inspection (`model-manager`), KV-cache sessions (`session-manager`), loopback OpenAI API (`local-server`), and Android share/text-action intent routing (`system-integration`).
+- **Unified `InferenceBackend` Contract**: Added sealed `EngineLifecycleState`, structured `EngineError` hierarchy, `ModelId`/`SessionId` isolation, `Mutex`-serialized concurrency, `Flow` streaming, `tokenize`/`detokenize`, `embed`, `saveSession`/`loadSession`, and throughput benchmarking.
+- **Native Hardware & RAM Admission Diagnostics**: Reads `/proc/cpuinfo` SIMD flags (`NEON`, `DOTPROD`, `I8MM`, `FP16`), `/sys` CPU cluster frequencies, `ActivityManager` free RAM, and `PowerManager` thermal status; exposes recommended thread tuning and `Run Bench` in Inference Settings.
+- **GGUF Binary Header Inspection & KV-Cache Sessions**: Parses GGUF architecture and context length metadata on-device without loading full weights, enforces `n_ctx` token budgets, and saves/restores per-thread KV snapshots.
+- **Android Share & Text Selection Entry**: Added `ACTION_SEND` and `ACTION_PROCESS_TEXT` intents to open shared text directly in a local QuantChat draft.
+
 ## v1.1.0 (Build 2) - 2026-11-22
 
 ### Fixes & Improvements

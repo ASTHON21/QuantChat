@@ -1084,6 +1084,23 @@ private fun LocalWeightCard(
                             else -> QuantOutline
                         }
                     )
+                    if (!file.isPartial) {
+                        val metaParts = buildList {
+                            file.headerMetadata?.architecture?.let { add("arch: $it") }
+                            file.headerMetadata?.declaredContextLength?.let { add("maxCtx: $it") }
+                            file.admission?.summary?.let { add(it) }
+                        }
+                        if (metaParts.isNotEmpty()) {
+                            Text(
+                                text = metaParts.joinToString(" · "),
+                                style = QuantTextStyles.LabelSm,
+                                color = QuantOnSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                    }
                 }
             }
 

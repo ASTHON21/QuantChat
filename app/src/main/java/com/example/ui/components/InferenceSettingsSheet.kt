@@ -10,12 +10,15 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -23,6 +26,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -45,11 +49,14 @@ import com.example.ui.theme.QuantOnSurface
 import com.example.ui.theme.QuantOnSurfaceVariant
 import com.example.ui.theme.QuantOutline
 import com.example.ui.theme.QuantOutlineVariant
+import com.example.ui.theme.QuantRose
 import com.example.ui.theme.QuantSurfaceContainer
 import com.example.ui.theme.QuantSurfaceHigh
 import com.example.ui.theme.QuantSurfaceLow
 import com.example.ui.theme.QuantSurfaceLowest
 import com.example.ui.theme.QuantTextStyles
+import com.quantchat.hardware.ThermalSeverity
+import com.quantchat.resource.OrchestratorSnapshot
 import java.util.Locale
 
 private val SYSTEM_PROMPT_PRESETS = listOf(
@@ -62,6 +69,10 @@ private val SYSTEM_PROMPT_PRESETS = listOf(
 @Composable
 fun InferenceSettingsSheet(
     currentSettings: InferenceSettings,
+    orchestratorSnapshot: OrchestratorSnapshot? = null,
+    isModelReady: Boolean = false,
+    onRefreshDiagnostics: () -> Unit = {},
+    onRunBenchmark: () -> Unit = {},
     onDismiss: () -> Unit,
     onApply: (InferenceSettings) -> Unit,
     onOpenVersionInfo: () -> Unit = {}
@@ -71,6 +82,10 @@ fun InferenceSettingsSheet(
     var contextSize by remember(currentSettings) { mutableIntStateOf(currentSettings.contextSize) }
     var maxTokens by remember(currentSettings) { mutableIntStateOf(currentSettings.maxTokens) }
     var temperature by remember(currentSettings) { mutableFloatStateOf(currentSettings.temperature) }
+
+    LaunchedEffect(Unit) {
+        onRefreshDiagnostics()
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -109,6 +124,15 @@ fun InferenceSettingsSheet(
                     modifier = Modifier
                         .background(QuantSurfaceContainer, RoundedCornerShape(4.dp))
                         .padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+            }
+
+            if (orchestratorSnapshot != null) {
+                HardwareCapabilitiesCard(
+                    snapshot = orchestratorSnapshot,
+                    isModelReady = isModelReady,
+                    onApplyRecommendedThreads = { rec -> threads = rec },
+                    onRunBenchmark = onRunBenchmark
                 )
             }
 
@@ -159,8 +183,9 @@ fun InferenceSettingsSheet(
             }
 
             // CPU Threads
+            val recThreads = orchestratorSnapshot?.recommendedThreads
             ChipSelectorRow(
-                label = "CPU THREADS",
+                label = if (recThreads != null) "CPU THREADS (REC ${recThreads}T)" else "CPU THREADS",
                 options = listOf(2, 4, 6, 8),
                 selected = threads,
                 formatter = { "${it}T" },
@@ -285,6 +310,152 @@ fun InferenceSettingsSheet(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun HardwareCapabilitiesCard(
+    snapshot: OrchestratorSnapshot,
+    isModelReady: Boolean,
+    onApplyRecommendedThreads: (Int) -> Unit,
+    onRunBenchmark: () -> Unit
+) {
+    val profile = snapshot.hardwareProfile
+    val metrics = snapshot.liveMetrics ?: profile?.liveMetrics
+    val bench = snapshot.lastBenchmark
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .background(QuantSurfaceLowest)
+            .border(1.dp, QuantSurfaceHigh, RoundedCornerShape(6.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "HARDWARE & RUNTIME CAPABILITIES",
+                style = QuantTextStyles.LabelSm,
+                color = QuantEmerald
+            )
+            Text(
+                text = "${snapshot.versionInfo.backendId.uppercase(Locale.US)} · ${snapshot.versionInfo.engineVersion}",
+                style = QuantTextStyles.LabelSm,
+                color = QuantOutline
+            )
+        }
+
+        if (profile != null) {
+            val simdText = if (profile.cpuFeatures.isNotEmpty()) {
+                profile.cpuFeatures.joinToString(" · ")
+            } else {
+                "Standard ${profile.primaryAbi}"
+            }
+            DiagRow(label = "CPU / SIMD", value = "${profile.cpuClusters.topologyLabel} · $simdText")
+            DiagRow(
+                label = "Backend",
+                value = if (profile.activeBackendGpuSupported) "GPU Ready" else "CPU Only (GPU/NPU Off in 0.4.0)"
+            )
+        }
+
+        if (metrics != null) {
+            val thermalColor = when (metrics.thermalSeverity) {
+                ThermalSeverity.SEVERE, ThermalSeverity.CRITICAL -> QuantRose
+                else -> QuantOnSurfaceVariant
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(text = "Memory / Thermal", style = QuantTextStyles.LabelSm, color = QuantOutline)
+                Text(
+                    text = "${metrics.availableRamMb}MB / ${metrics.totalRamMb}MB free · ${metrics.thermalSeverity.label}",
+                    style = QuantTextStyles.DataTabular,
+                    color = thermalColor
+                )
+            }
+        }
+
+        HorizontalDivider(color = QuantSurfaceHigh, thickness = 0.8.dp)
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Apply ${snapshot.recommendedThreads}T Optimal",
+                style = QuantTextStyles.LabelSm.copy(fontWeight = FontWeight.SemiBold),
+                color = QuantEmerald,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(QuantEmerald.copy(alpha = 0.14f))
+                    .clickable { onApplyRecommendedThreads(snapshot.recommendedThreads) }
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
+            )
+
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(if (isModelReady) QuantSurfaceContainer else QuantSurfaceLow)
+                    .border(
+                        1.dp,
+                        if (isModelReady) QuantEmerald.copy(alpha = 0.4f) else QuantSurfaceHigh,
+                        RoundedCornerShape(4.dp)
+                    )
+                    .clickable(enabled = isModelReady && !snapshot.isBenchmarking, onClick = onRunBenchmark)
+                    .padding(horizontal = 9.dp, vertical = 5.dp)
+                    .testTag("run_benchmark_button"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (snapshot.isBenchmarking) {
+                    CircularProgressIndicator(
+                        color = QuantEmerald,
+                        strokeWidth = 1.8.dp,
+                        modifier = Modifier.size(11.dp)
+                    )
+                    Text("Benchmarking...", style = QuantTextStyles.LabelSm, color = QuantEmerald)
+                } else {
+                    Text(
+                        text = if (isModelReady) "Run Bench" else "Load Model to Bench",
+                        style = QuantTextStyles.LabelSm.copy(fontWeight = FontWeight.SemiBold),
+                        color = if (isModelReady) QuantEmerald else QuantOutline
+                    )
+                }
+            }
+        }
+
+        if (bench != null) {
+            Text(
+                text = String.format(
+                    Locale.US,
+                    "LAST BENCH · PP %.1f tok/s (%dt) · TG %.1f tok/s (%dt)",
+                    bench.prefillTokensPerSec,
+                    bench.prefillTokens,
+                    bench.decodeTokensPerSec,
+                    bench.decodeTokens
+                ),
+                style = QuantTextStyles.DataTabular,
+                color = QuantEmerald
+            )
+        }
+    }
+}
+
+@Composable
+private fun DiagRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(text = label, style = QuantTextStyles.LabelSm, color = QuantOutline)
+        Text(text = value, style = QuantTextStyles.LabelSm, color = QuantOnSurfaceVariant)
     }
 }
 

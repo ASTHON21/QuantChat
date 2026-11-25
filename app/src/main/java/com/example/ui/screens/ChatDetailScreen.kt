@@ -83,6 +83,7 @@ import com.example.ui.theme.QuantSurfaceHighest
 import com.example.ui.theme.QuantSurfaceLow
 import com.example.ui.theme.QuantSurfaceLowest
 import com.example.ui.theme.QuantTextStyles
+import com.quantchat.resource.OrchestratorSnapshot
 import java.util.Locale
 
 private val STARTER_PROMPTS = listOf(
@@ -100,6 +101,9 @@ fun ChatDetailScreen(
     readyLocalFiles: List<LocalWeightFile>,
     inferenceSettings: InferenceSettings,
     isGenerating: Boolean,
+    orchestratorSnapshot: OrchestratorSnapshot? = null,
+    initialDraftText: String? = null,
+    onDraftConsumed: () -> Unit = {},
     onBack: () -> Unit,
     onLoadLocalModel: (LocalWeightFile) -> Unit,
     onUnloadLocalModel: () -> Unit,
@@ -115,6 +119,13 @@ fun ChatDetailScreen(
     var modelDropdownExpanded by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val clipboardManager = LocalClipboardManager.current
+
+    LaunchedEffect(initialDraftText) {
+        if (!initialDraftText.isNullOrBlank()) {
+            inputText = initialDraftText
+            onDraftConsumed()
+        }
+    }
 
     val combinedMessages = remember(messages, streamingMessage, thread.id) {
         if (streamingMessage != null &&
@@ -357,8 +368,18 @@ fun ChatDetailScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    val budget = orchestratorSnapshot?.lastContextBudget
+                    val leftTelemetry = buildString {
+                        if (budget != null) {
+                            append("CTX ${budget.promptTokens}/${budget.contextLimit}")
+                            if (budget.kvCacheHit) append(" · KV HIT")
+                        } else {
+                            append("CTX ${inferenceSettings.contextSize}")
+                        }
+                        append(" · ${inferenceSettings.threads}T · TEMP ${String.format(Locale.US, "%.2f", inferenceSettings.temperature)}")
+                    }
                     Text(
-                        text = "CTX ${inferenceSettings.contextSize} · ${inferenceSettings.threads}T · TEMP ${String.format(Locale.US, "%.2f", inferenceSettings.temperature)}",
+                        text = leftTelemetry,
                         style = QuantTextStyles.LabelSm.copy(letterSpacing = 0.5.sp),
                         color = QuantOutline
                     )
