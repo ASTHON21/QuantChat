@@ -134,6 +134,7 @@ dependencies {
   // implementation(libs.converter.moshi)
   implementation(project(":engine-core"))
   implementation(project(":engine-llamacpp"))
+  implementation(project(":engine-vulkan"))
   implementation(project(":hardware-manager"))
   implementation(project(":resource-manager"))
   implementation(project(":model-manager"))

@@ -44,6 +44,8 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -76,6 +78,7 @@ import com.example.ui.theme.QuantOnSurface
 import com.example.ui.theme.QuantOnSurfaceVariant
 import com.example.ui.theme.QuantOutline
 import com.example.ui.theme.QuantRose
+import com.example.ui.theme.QuantRoseContainer
 import com.example.ui.theme.QuantSurface
 import com.example.ui.theme.QuantSurfaceContainer
 import com.example.ui.theme.QuantSurfaceHigh
@@ -83,6 +86,9 @@ import com.example.ui.theme.QuantSurfaceHighest
 import com.example.ui.theme.QuantSurfaceLow
 import com.example.ui.theme.QuantSurfaceLowest
 import com.example.ui.theme.QuantTextStyles
+import com.quantchat.engine.core.AcceleratorBackendType
+import com.quantchat.engine.core.AcceleratorPreference
+import com.quantchat.engine.core.CpuScheduleMode
 import com.quantchat.resource.OrchestratorSnapshot
 import java.util.Locale
 
@@ -110,6 +116,9 @@ fun ChatDetailScreen(
     onClearMessages: () -> Unit,
     onOpenInferenceSettings: () -> Unit,
     onGoToModels: () -> Unit,
+    onSelectScheduleMode: (CpuScheduleMode) -> Unit = {},
+    onToggleAutoThermal: (Boolean) -> Unit = {},
+    onSelectAcceleratorPreference: (AcceleratorPreference) -> Unit = {},
     onSendMessage: (String) -> Unit,
     onStopGeneration: () -> Unit,
     onCopiedMessage: () -> Unit,
@@ -117,6 +126,8 @@ fun ChatDetailScreen(
 ) {
     var inputText by remember { mutableStateOf("") }
     var modelDropdownExpanded by remember { mutableStateOf(false) }
+    var scheduleMenuExpanded by remember { mutableStateOf(false) }
+    var acceleratorMenuExpanded by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val clipboardManager = LocalClipboardManager.current
 
@@ -364,7 +375,7 @@ fun ChatDetailScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(QuantSurfaceLowest)
-                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                        .padding(horizontal = 12.dp, vertical = 5.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -372,31 +383,332 @@ fun ChatDetailScreen(
                     val leftTelemetry = buildString {
                         if (budget != null) {
                             append("CTX ${budget.promptTokens}/${budget.contextLimit}")
-                            if (budget.kvCacheHit) append(" · KV HIT")
+                            if (budget.kvCacheHit) append(" · KV")
                         } else {
                             append("CTX ${inferenceSettings.contextSize}")
                         }
-                        append(" · ${inferenceSettings.threads}T · TEMP ${String.format(Locale.US, "%.2f", inferenceSettings.temperature)}")
+                        append(" · T=${String.format(Locale.US, "%.2f", inferenceSettings.temperature)}")
                     }
                     Text(
                         text = leftTelemetry,
-                        style = QuantTextStyles.LabelSm.copy(letterSpacing = 0.5.sp),
-                        color = QuantOutline
+                        style = QuantTextStyles.LabelSm.copy(letterSpacing = 0.3.sp),
+                        color = QuantOutline,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false).padding(end = 6.dp)
                     )
-                    Text(
-                        text = when (runtimeState) {
-                            is LocalRuntimeState.Ready -> "100% OFFLINE GGUF"
-                            is LocalRuntimeState.Loading -> "LOADING WEIGHTS..."
-                            is LocalRuntimeState.Error -> "LOAD ERROR"
-                            is LocalRuntimeState.Unloaded -> "UNLOADED"
-                        },
-                        style = QuantTextStyles.LabelSm,
-                        color = when (runtimeState) {
-                            is LocalRuntimeState.Ready -> QuantEmerald
-                            is LocalRuntimeState.Error -> QuantError
-                            else -> QuantOutline
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        val backendStatus = orchestratorSnapshot?.backendRuntimeStatus
+                        val isGpuActive = backendStatus?.activeBackend == AcceleratorBackendType.VULKAN_GPU
+                        val isFallback = backendStatus?.fallbackOccurred == true
+                        val accelLabel = when {
+                            isGpuActive -> {
+                                val applied = backendStatus?.appliedGpuLayers ?: 0
+                                val total = backendStatus?.totalModelLayers ?: 0
+                                if (total > 0 && applied >= total) "GPU · VK FULL"
+                                else if (total > 0) "GPU · VK ${applied}/${total}L"
+                                else "GPU · VK ${applied}L"
+                            }
+                            isFallback -> "CPU · VK FALLBACK"
+                            else -> "CPU · SAFE"
                         }
-                    )
+                        val accelColor = when {
+                            isGpuActive -> QuantEmerald
+                            isFallback -> QuantRose
+                            else -> QuantOnSurfaceVariant
+                        }
+                        val accelBg = when {
+                            isGpuActive -> QuantEmerald.copy(alpha = 0.14f)
+                            isFallback -> QuantRoseContainer
+                            else -> QuantSurfaceContainer
+                        }
+                        val accelBorder = when {
+                            isGpuActive -> QuantEmerald.copy(alpha = 0.4f)
+                            isFallback -> QuantRose.copy(alpha = 0.45f)
+                            else -> QuantSurfaceHigh
+                        }
+
+                        Box {
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(accelBg)
+                                    .border(0.8.dp, accelBorder, RoundedCornerShape(4.dp))
+                                    .clickable { acceleratorMenuExpanded = true }
+                                    .padding(horizontal = 7.dp, vertical = 4.dp)
+                                    .testTag("chat_accelerator_pill"),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Text(
+                                    text = accelLabel,
+                                    style = QuantTextStyles.LabelSm.copy(fontWeight = FontWeight.SemiBold),
+                                    color = accelColor,
+                                    maxLines = 1
+                                )
+                                Icon(
+                                    imageVector = Icons.Filled.ExpandMore,
+                                    contentDescription = "Select Accelerator Backend",
+                                    tint = accelColor,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                            }
+
+                            DropdownMenu(
+                                expanded = acceleratorMenuExpanded,
+                                onDismissRequest = { acceleratorMenuExpanded = false },
+                                modifier = Modifier.background(QuantSurfaceLow)
+                            ) {
+                                val probe = orchestratorSnapshot?.vulkanCapabilities
+                                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                                    Text(
+                                        text = if (isGpuActive) {
+                                            "BACKEND · ${backendStatus?.activeDeviceLabel ?: "VULKAN GPU"}"
+                                        } else {
+                                            "BACKEND · ${backendStatus?.statusSummary ?: "CPU SAFE"}"
+                                        },
+                                        style = QuantTextStyles.LabelSm,
+                                        color = accelColor
+                                    )
+                                    val detailText = when {
+                                        isFallback && !backendStatus?.fallbackReason.isNullOrBlank() ->
+                                            "Fallback: ${backendStatus?.fallbackReason}"
+                                        probe != null ->
+                                            probe.deviceName?.let { "$it · ${probe.selfTestSummary}" } ?: probe.selfTestSummary
+                                        else -> "Vulkan capability probe pending"
+                                    }
+                                    Text(
+                                        text = detailText,
+                                        style = QuantTextStyles.BodySm,
+                                        color = if (isFallback) QuantRose else QuantOutline
+                                    )
+                                }
+                                HorizontalDivider(color = QuantSurfaceHigh, thickness = 0.8.dp)
+
+                                AcceleratorPreference.entries.forEach { pref ->
+                                    val selected = inferenceSettings.acceleratorPreference == pref
+                                    DropdownMenuItem(
+                                        modifier = Modifier.testTag("accel_menu_${pref.name.lowercase(Locale.US)}"),
+                                        text = {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = pref.label,
+                                                        style = QuantTextStyles.LabelMd,
+                                                        color = if (selected) QuantEmerald else QuantOnSurface
+                                                    )
+                                                    Text(
+                                                        text = pref.description,
+                                                        style = QuantTextStyles.LabelSm,
+                                                        color = QuantOutline
+                                                    )
+                                                }
+                                                if (selected) {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.Check,
+                                                        contentDescription = "Selected Backend",
+                                                        tint = QuantEmerald,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                }
+                                            }
+                                        },
+                                        onClick = {
+                                            acceleratorMenuExpanded = false
+                                            onSelectAcceleratorPreference(pref)
+                                        }
+                                    )
+                                }
+                                HorizontalDivider(color = QuantSurfaceHigh, thickness = 0.8.dp)
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "GPU Offload & Vulkan Probe →",
+                                            style = QuantTextStyles.LabelMd,
+                                            color = QuantEmerald
+                                        )
+                                    },
+                                    onClick = {
+                                        acceleratorMenuExpanded = false
+                                        onOpenInferenceSettings()
+                                    }
+                                )
+                            }
+                        }
+
+                        val decision = orchestratorSnapshot?.schedulingDecision
+                        val effectiveMode = decision?.effectiveMode ?: inferenceSettings.scheduleMode
+                        val effectiveThreads = decision?.effectiveThreads ?: inferenceSettings.threads
+                        val isThrottled = decision?.isThermallyThrottled == true
+                        val pillLabel = if (isThrottled && decision?.requestedMode != CpuScheduleMode.THERMAL_SAFE) {
+                            "THERMAL SAFE · ${effectiveThreads}T (AUTO)"
+                        } else {
+                            "${effectiveMode.label.uppercase(Locale.US)} · ${effectiveThreads}T"
+                        }
+                        val pillTextColor = when {
+                            isThrottled || effectiveMode == CpuScheduleMode.THERMAL_SAFE -> QuantRose
+                            effectiveMode == CpuScheduleMode.ECO -> QuantOnSurfaceVariant
+                            else -> QuantEmerald
+                        }
+                        val pillBg = when {
+                            isThrottled || effectiveMode == CpuScheduleMode.THERMAL_SAFE -> QuantRoseContainer
+                            effectiveMode == CpuScheduleMode.ECO -> QuantSurfaceContainer
+                            else -> QuantEmerald.copy(alpha = 0.12f)
+                        }
+                        val pillBorder = when {
+                            isThrottled || effectiveMode == CpuScheduleMode.THERMAL_SAFE -> QuantRose.copy(alpha = 0.45f)
+                            effectiveMode == CpuScheduleMode.ECO -> QuantSurfaceHigh
+                            else -> QuantEmerald.copy(alpha = 0.35f)
+                        }
+
+                        Box {
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(pillBg)
+                                    .border(0.8.dp, pillBorder, RoundedCornerShape(4.dp))
+                                    .clickable { scheduleMenuExpanded = true }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .testTag("chat_cpu_profile_pill"),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = pillLabel,
+                                    style = QuantTextStyles.LabelSm.copy(fontWeight = FontWeight.SemiBold),
+                                    color = pillTextColor,
+                                    maxLines = 1
+                                )
+                                Icon(
+                                    imageVector = Icons.Filled.ExpandMore,
+                                    contentDescription = "Select CPU Schedule Mode",
+                                    tint = pillTextColor,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                            }
+
+                            DropdownMenu(
+                                expanded = scheduleMenuExpanded,
+                                onDismissRequest = { scheduleMenuExpanded = false },
+                                modifier = Modifier.background(QuantSurfaceLow)
+                            ) {
+                                val rationale = decision?.rationale ?: "Dynamic per-request n_threads"
+                                val thermalLabel = orchestratorSnapshot?.liveMetrics?.thermalSeverity?.label ?: "Unknown"
+                                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                                    Text(
+                                        text = "CPU SCHEDULER · THERMAL: ${thermalLabel.uppercase(Locale.US)}",
+                                        style = QuantTextStyles.LabelSm,
+                                        color = if (isThrottled) QuantRose else QuantEmerald
+                                    )
+                                    Text(
+                                        text = rationale,
+                                        style = QuantTextStyles.BodySm,
+                                        color = QuantOutline
+                                    )
+                                }
+                                HorizontalDivider(color = QuantSurfaceHigh, thickness = 0.8.dp)
+
+                                CpuScheduleMode.entries.forEach { mode ->
+                                    val isRequested = inferenceSettings.scheduleMode == mode
+                                    val previewThreads = orchestratorSnapshot?.modeThreadPreview?.get(mode)
+                                    val modeColor = if (mode == CpuScheduleMode.THERMAL_SAFE) QuantRose else QuantEmerald
+                                    DropdownMenuItem(
+                                        modifier = Modifier.testTag("schedule_menu_mode_${mode.name.lowercase(Locale.US)}"),
+                                        text = {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = if (previewThreads != null) {
+                                                            "${mode.label} · ${previewThreads}T"
+                                                        } else {
+                                                            mode.label
+                                                        },
+                                                        style = QuantTextStyles.LabelMd,
+                                                        color = if (isRequested) modeColor else QuantOnSurface
+                                                    )
+                                                    Text(
+                                                        text = mode.scenarioHint,
+                                                        style = QuantTextStyles.LabelSm,
+                                                        color = QuantOutline
+                                                    )
+                                                }
+                                                if (isRequested) {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.Check,
+                                                        contentDescription = "Selected Mode",
+                                                        tint = modeColor,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                }
+                                            }
+                                        },
+                                        onClick = {
+                                            scheduleMenuExpanded = false
+                                            onSelectScheduleMode(mode)
+                                        }
+                                    )
+                                }
+
+                                HorizontalDivider(color = QuantSurfaceHigh, thickness = 0.8.dp)
+                                DropdownMenuItem(
+                                    modifier = Modifier.testTag("schedule_menu_auto_thermal_toggle"),
+                                    text = {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                                Text(
+                                                    text = "Auto Thermal Safe",
+                                                    style = QuantTextStyles.LabelMd,
+                                                    color = QuantOnSurface
+                                                )
+                                                Text(
+                                                    text = "Auto-downshift at Moderate+ temp",
+                                                    style = QuantTextStyles.LabelSm,
+                                                    color = QuantOutline
+                                                )
+                                            }
+                                            Text(
+                                                text = if (inferenceSettings.autoThermalDownshift) "ON" else "OFF",
+                                                style = QuantTextStyles.LabelSm.copy(fontWeight = FontWeight.SemiBold),
+                                                color = if (inferenceSettings.autoThermalDownshift) QuantEmerald else QuantOutline
+                                            )
+                                        }
+                                    },
+                                    onClick = {
+                                        onToggleAutoThermal(!inferenceSettings.autoThermalDownshift)
+                                    }
+                                )
+                            }
+                        }
+
+                        Text(
+                            text = when (runtimeState) {
+                                is LocalRuntimeState.Ready -> "OFFLINE"
+                                is LocalRuntimeState.Loading -> "LOADING"
+                                is LocalRuntimeState.Error -> "ERROR"
+                                is LocalRuntimeState.Unloaded -> "IDLE"
+                            },
+                            style = QuantTextStyles.LabelSm,
+                            color = when (runtimeState) {
+                                is LocalRuntimeState.Ready -> QuantEmerald
+                                is LocalRuntimeState.Error -> QuantError
+                                else -> QuantOutline
+                            }
+                        )
+                    }
                 }
             }
 
@@ -469,6 +781,7 @@ fun ChatDetailScreen(
                         ChatRole.USER -> UserChatBubble(message = msg)
                         ChatRole.ASSISTANT -> AssistantChatBubble(
                             message = msg,
+                            isVulkanActive = orchestratorSnapshot?.backendRuntimeStatus?.activeBackend == AcceleratorBackendType.VULKAN_GPU,
                             onCopy = {
                                 clipboardManager.setText(AnnotatedString(msg.text))
                                 onCopiedMessage()
@@ -732,6 +1045,7 @@ private fun UserChatBubble(message: ChatMessage) {
 @Composable
 private fun AssistantChatBubble(
     message: ChatMessage,
+    isVulkanActive: Boolean = false,
     onCopy: () -> Unit
 ) {
     Column(
@@ -799,7 +1113,11 @@ private fun AssistantChatBubble(
                         modifier = Modifier.size(14.dp)
                     )
                     Text(
-                        text = "Evaluating prompt on local CPU...",
+                        text = if (isVulkanActive) {
+                            "Evaluating prompt on Vulkan GPU..."
+                        } else {
+                            "Evaluating prompt on local CPU..."
+                        },
                         style = QuantTextStyles.BodySm,
                         color = QuantOutline
                     )

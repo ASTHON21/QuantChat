@@ -5,11 +5,14 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.provider.OpenableColumns
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.quantchat.engine.core.AcceleratorPreference
+import com.quantchat.engine.core.CpuScheduleMode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -37,6 +40,14 @@ private val KEY_CONTEXT_SIZE = intPreferencesKey("llama_context_size")
 private val KEY_MAX_TOKENS = intPreferencesKey("llama_max_tokens")
 private val KEY_TEMPERATURE = floatPreferencesKey("llama_temperature")
 private val KEY_LAST_LOADED_FILE = stringPreferencesKey("llama_last_loaded_file")
+private val KEY_SCHEDULE_MODE = stringPreferencesKey("cpu_schedule_mode")
+private val KEY_AUTO_THERMAL_DOWNSHIFT = booleanPreferencesKey("auto_thermal_downshift")
+private val KEY_MANUAL_THREADS_OVERRIDE = intPreferencesKey("manual_threads_override")
+private val KEY_CALIBRATED_OPTIMAL_THREADS = intPreferencesKey("calibrated_optimal_threads")
+private val KEY_CALIBRATED_DEVICE_SIG = stringPreferencesKey("calibrated_device_sig")
+private val KEY_ACCELERATOR_PREFERENCE = stringPreferencesKey("accelerator_preference")
+private val KEY_AUTO_GPU_OFFLOAD = booleanPreferencesKey("auto_gpu_offload")
+private val KEY_MANUAL_GPU_LAYERS = intPreferencesKey("manual_gpu_layers")
 
 class HfAuthRequiredException(message: String) : IOException(message)
 class HfNetworkException(message: String) : IOException(message)
@@ -74,13 +85,29 @@ class HuggingFaceModelRepository(private val context: Context) {
     }
 
     val inferenceSettingsFlow: Flow<InferenceSettings> = context.hfDataStore.data.map { prefs ->
+        val savedModeName = prefs[KEY_SCHEDULE_MODE]
+        val scheduleMode = CpuScheduleMode.entries.firstOrNull { it.name == savedModeName }
+            ?: CpuScheduleMode.BALANCED
+        val savedAccelName = prefs[KEY_ACCELERATOR_PREFERENCE]
+        val acceleratorPref = AcceleratorPreference.entries.firstOrNull { it.name == savedAccelName }
+            ?: AcceleratorPreference.AUTO
+        val manualOverride = prefs[KEY_MANUAL_THREADS_OVERRIDE]?.coerceIn(1, 12)
+        val calibratedThreads = prefs[KEY_CALIBRATED_OPTIMAL_THREADS]?.coerceIn(1, 12)
         InferenceSettings(
             systemPrompt = prefs[KEY_SYSTEM_PROMPT] ?: InferenceSettings.DEFAULT_SYSTEM_PROMPT,
-            threads = (prefs[KEY_THREADS] ?: 4).coerceIn(1, 8),
+            threads = (prefs[KEY_THREADS] ?: 4).coerceIn(1, 12),
             contextSize = (prefs[KEY_CONTEXT_SIZE] ?: 2048).coerceIn(512, 8192),
             maxTokens = (prefs[KEY_MAX_TOKENS] ?: 512).coerceIn(64, 4096),
             temperature = (prefs[KEY_TEMPERATURE] ?: 0.3f).coerceIn(0f, 1.5f),
-            lastLoadedDiskFileName = prefs[KEY_LAST_LOADED_FILE]
+            lastLoadedDiskFileName = prefs[KEY_LAST_LOADED_FILE],
+            scheduleMode = scheduleMode,
+            autoThermalDownshift = prefs[KEY_AUTO_THERMAL_DOWNSHIFT] ?: true,
+            manualThreadsOverride = manualOverride,
+            calibratedOptimalThreads = calibratedThreads,
+            calibratedDeviceSignature = prefs[KEY_CALIBRATED_DEVICE_SIG],
+            acceleratorPreference = acceleratorPref,
+            autoGpuLayerOffload = prefs[KEY_AUTO_GPU_OFFLOAD] ?: true,
+            manualGpuLayers = (prefs[KEY_MANUAL_GPU_LAYERS] ?: 0).coerceIn(0, 128)
         )
     }
 
@@ -100,7 +127,7 @@ class HuggingFaceModelRepository(private val context: Context) {
             prefs[KEY_SYSTEM_PROMPT] = settings.systemPrompt.trim().ifEmpty {
                 InferenceSettings.DEFAULT_SYSTEM_PROMPT
             }
-            prefs[KEY_THREADS] = settings.threads
+            prefs[KEY_THREADS] = settings.threads.coerceIn(1, 12)
             prefs[KEY_CONTEXT_SIZE] = settings.contextSize
             prefs[KEY_MAX_TOKENS] = settings.maxTokens
             prefs[KEY_TEMPERATURE] = settings.temperature
@@ -109,6 +136,31 @@ class HuggingFaceModelRepository(private val context: Context) {
             } else {
                 prefs[KEY_LAST_LOADED_FILE] = settings.lastLoadedDiskFileName
             }
+            prefs[KEY_SCHEDULE_MODE] = settings.scheduleMode.name
+            prefs[KEY_AUTO_THERMAL_DOWNSHIFT] = settings.autoThermalDownshift
+            if (settings.manualThreadsOverride == null) {
+                prefs.remove(KEY_MANUAL_THREADS_OVERRIDE)
+            } else {
+                prefs[KEY_MANUAL_THREADS_OVERRIDE] = settings.manualThreadsOverride.coerceIn(1, 12)
+            }
+            if (settings.calibratedOptimalThreads == null || settings.calibratedDeviceSignature.isNullOrBlank()) {
+                prefs.remove(KEY_CALIBRATED_OPTIMAL_THREADS)
+                prefs.remove(KEY_CALIBRATED_DEVICE_SIG)
+            } else {
+                prefs[KEY_CALIBRATED_OPTIMAL_THREADS] = settings.calibratedOptimalThreads.coerceIn(1, 12)
+                prefs[KEY_CALIBRATED_DEVICE_SIG] = settings.calibratedDeviceSignature
+            }
+            prefs[KEY_ACCELERATOR_PREFERENCE] = settings.acceleratorPreference.name
+            prefs[KEY_AUTO_GPU_OFFLOAD] = settings.autoGpuLayerOffload
+            prefs[KEY_MANUAL_GPU_LAYERS] = settings.manualGpuLayers.coerceIn(0, 128)
+        }
+    }
+
+    suspend fun saveCalibratedThreads(optimalThreads: Int, deviceSignature: String) {
+        context.hfDataStore.edit { prefs ->
+            prefs[KEY_CALIBRATED_OPTIMAL_THREADS] = optimalThreads.coerceIn(1, 12)
+            prefs[KEY_CALIBRATED_DEVICE_SIG] = deviceSignature
+            prefs[KEY_THREADS] = optimalThreads.coerceIn(1, 12)
         }
     }
 

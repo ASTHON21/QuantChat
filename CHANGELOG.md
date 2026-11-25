@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.4.0 (Build 5) - 2026-11-25
+
+### Phase 1.2: Native Vulkan GPU Acceleration & Safe CPU Failover
+- **Modular Vulkan Backend (`engine-vulkan`)**: Added pluggable `VulkanLlamaBackend`, `VulkanNativeBridge`, `CMakeLists.txt`, and C++17 `quantchat_vulkan_jni.cpp` integrating `llama.cpp` `ggml-vulkan` (`arm64-v8a` built in GitHub Actions CI with safe `System.loadLibrary` fallback when omitted).
+- **Resilient GPU → CPU Failover (`engine-core`)**: Added `ResilientFailoverBackend` that probes Vulkan readiness before GPU load, catches initialization or pre-decode runtime faults, tears down partial Vulkan handles, and falls back seamlessly to the existing `LlamaCppBackend` CPU path.
+- **3-Layer Vulkan Probing & Self-Test (`hardware-manager`)**: Added `VulkanCapabilityProbe` inspecting Android `FEATURE_VULKAN_HARDWARE_LEVEL` / version, GPU vendor/memory heaps, `VK_KHR_16bit_storage` / `shaderFloat16`, and executing an actual GPU buffer allocation/transfer + `ggml-vulkan` check (`OpenCL` explicitly tracked as Phase 2).
+- **Auto RAM/VRAM `n_gpu_layers` Planner & Controls (`resource-manager` / `app`)**: Added `GpuOffloadPlanner` respecting unified LPDDR safety headroom, DataStore-persisted 3-mode accelerator preference (`Auto`, `Prefer Vulkan`, `CPU Only`), manual layer slider, clickable Chat GPU/CPU status pill, and GPU probe action in Inference Settings.
+
+## v1.3.0 (Build 4) - 2026-11-25
+
+### Phase 1.1: Native CPU Cluster Scheduling & Thread Calibration
+- **Sysfs CPU Cluster Probing (`hardware-manager`)**: Reads `/sys/devices/system/cpu/online`, `cpu_capacity`, `cpufreq/cpuinfo_max_freq`, and `topology/cluster_id` with non-root kernel restriction fallback to classify `Prime / Big / LITTLE` core groups.
+- **4-Mode Adaptive CPU Scheduler (`resource-manager`)**: Implements `Eco`, `Balanced`, `Performance`, and `Thermal Safe` profiles with prompt/context workload classification (`LIGHT`, `STANDARD`, `LONG_CONTEXT`), dynamic per-request `n_threads` injection, and legal `Process.setThreadPriority` hints (no root ops or model reload required).
+- **Live Thermal Protection**: Registers `PowerManager.OnThermalStatusChangedListener` (API 29+) to auto-downshift to `Thermal Safe` at `MODERATE`+ thermal states and restore when cooled.
+- **1-Tap Multi-Thread Calibration & Quick Controls**: Sweeps topology-aware thread candidates via `InferenceBackend.benchmarkWithThreads(...)`, persists optimal thread count by device signature in DataStore, and adds a clickable CPU profile pill in Chat Detail plus full cluster matrix and calibration comparison table in Inference Settings.
+
 ## v1.2.0 (Build 3) - 2026-11-25
 
 ### Phase 0: Core Runtime Architecture & Native Probing

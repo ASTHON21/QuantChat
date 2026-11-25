@@ -286,6 +286,9 @@ fun QuantChatApp(
                             navController.popBackStack()
                             navigateToTab(QuantTab.MODELS)
                         },
+                        onSelectScheduleMode = viewModel::selectScheduleMode,
+                        onToggleAutoThermal = viewModel::toggleAutoThermalDownshift,
+                        onSelectAcceleratorPreference = viewModel::selectAcceleratorPreference,
                         onSendMessage = { text -> viewModel.sendChatMessage(threadId, text) },
                         onStopGeneration = viewModel::stopGeneration,
                         onCopiedMessage = {
@@ -306,6 +309,9 @@ fun QuantChatApp(
             isModelReady = runtimeState is LocalRuntimeState.Ready,
             onRefreshDiagnostics = viewModel::refreshHardwareDiagnostics,
             onRunBenchmark = viewModel::runHardwareBenchmark,
+            onCalibrateThreads = viewModel::calibrateOptimalThreads,
+            onCancelCalibration = viewModel::cancelCalibration,
+            onRunVulkanSelfTest = viewModel::runVulkanSelfTest,
             onDismiss = { showSettingsSheet = false },
             onApply = viewModel::updateInferenceSettings,
             onOpenVersionInfo = { showVersionSheet = true }

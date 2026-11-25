@@ -6,7 +6,12 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.PowerManager
 import com.quantchat.engine.core.EngineCapabilities
+import com.quantchat.engine.core.VulkanProbeResult
+import com.quantchat.engine.core.VulkanProbeStatus
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
@@ -25,14 +30,19 @@ data class CpuClusterSummary(
     val performanceCores: Int,
     val efficiencyCores: Int,
     val totalCores: Int,
-    val maxFreqMhz: Int
+    val maxFreqMhz: Int,
+    val onlineCores: Int = totalCores,
+    val cores: List<CpuCoreInfo> = emptyList(),
+    val clusters: List<CpuClusterGroup> = emptyList(),
+    val capacitySupported: Boolean = false,
+    val sysfsRestricted: Boolean = false
 ) {
     val topologyLabel: String
         get() = when {
             primeCores > 0 && performanceCores > 0 && efficiencyCores > 0 ->
-                "${totalCores}C (${primeCores}P+${performanceCores}M+${efficiencyCores}E)"
+                "${totalCores}C (${primeCores}P+${performanceCores}B+${efficiencyCores}E)"
             performanceCores > 0 && efficiencyCores > 0 ->
-                "${totalCores}C (${performanceCores}P+${efficiencyCores}E)"
+                "${totalCores}C (${performanceCores}B+${efficiencyCores}E)"
             else -> "${totalCores} Cores"
         }
 }
@@ -56,10 +66,64 @@ data class DeviceHardwareProfile(
     val activeBackendGpuSupported: Boolean,
     val activeBackendNpuSupported: Boolean,
     val gpuStatusSummary: String,
-    val liveMetrics: LiveDeviceMetrics
-)
+    val liveMetrics: LiveDeviceMetrics,
+    val vulkanCapabilities: VulkanProbeResult? = null,
+    val openClStatusNote: String = "OpenCL deferred to Phase 2 compatibility track"
+) {
+    val deviceTopologySignature: String
+        get() = "$socName|${cpuClusters.totalCores}|${cpuClusters.primeCores}-${cpuClusters.performanceCores}-${cpuClusters.efficiencyCores}"
+}
 
-class HardwareCapabilityManager(private val context: Context) {
+class HardwareCapabilityManager(
+    private val context: Context,
+    private val vulkanNativeProbe: (suspend () -> VulkanProbeResult)? = null
+) {
+
+    private val _thermalSeverityFlow = MutableStateFlow(readCurrentThermalStatus())
+    val thermalSeverityFlow: StateFlow<ThermalSeverity> = _thermalSeverityFlow.asStateFlow()
+
+    private val thermalListenerLock = Any()
+    private var registeredThermalListener: Any? = null
+
+    fun startThermalMonitoring() {
+        _thermalSeverityFlow.value = readCurrentThermalStatus()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        synchronized(thermalListenerLock) {
+            if (registeredThermalListener != null) return
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+            val listener = PowerManager.OnThermalStatusChangedListener { status ->
+                _thermalSeverityFlow.value = mapPowerThermalStatus(status)
+            }
+            val registered = runCatching {
+                pm.addThermalStatusListener(context.mainExecutor, listener)
+                true
+            }.getOrElse {
+                runCatching {
+                    pm.addThermalStatusListener(listener)
+                    true
+                }.getOrDefault(false)
+            }
+            if (registered) {
+                registeredThermalListener = listener
+            }
+        }
+    }
+
+    fun stopThermalMonitoring() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        synchronized(thermalListenerLock) {
+            val listener = registeredThermalListener as? PowerManager.OnThermalStatusChangedListener ?: return
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (pm != null) {
+                runCatching { pm.removeThermalStatusListener(listener) }
+            }
+            registeredThermalListener = null
+        }
+    }
+
+    suspend fun probeVulkanCapabilities(): VulkanProbeResult = withContext(Dispatchers.IO) {
+        VulkanCapabilityProbe.probe(context, vulkanNativeProbe)
+    }
 
     suspend fun probeHardware(engineCapabilities: EngineCapabilities): DeviceHardwareProfile =
         withContext(Dispatchers.IO) {
@@ -72,16 +136,22 @@ class HardwareCapabilityManager(private val context: Context) {
             }
 
             val cpuFlags = readCpuFeatures()
-            val clusters = readCpuClusters()
-            val hasVulkan = context.packageManager.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
+            val clusters = CpuTopologyParser.probeFromSysfs()
+            val vulkanProbe = VulkanCapabilityProbe.probe(context, vulkanNativeProbe)
+            val hasVulkan = vulkanProbe.systemVulkanSupported ||
+                context.packageManager.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
             val hasNnapi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1
             val metrics = currentMemoryAndThermalSnapshot()
 
-            val gpuSummary = if (engineCapabilities.supportsGpuOffload) {
-                "Vulkan / GPU Offload Ready"
-            } else {
-                val hwNote = if (hasVulkan) "Device has Vulkan" else "No Vulkan hardware"
-                "$hwNote · Runtime CPU-only (${engineCapabilities.gpuUnavailableReason ?: "no GPU backend"})"
+            val gpuSummary = when {
+                vulkanProbe.isUsableForInference ->
+                    "${vulkanProbe.deviceName ?: "Vulkan GPU"} · ${vulkanProbe.vulkanApiVersionLabel ?: vulkanProbe.systemVulkanVersion} Ready"
+                vulkanProbe.status == VulkanProbeStatus.NATIVE_LIBRARY_MISSING && hasVulkan ->
+                    "System Vulkan ${vulkanProbe.systemVulkanVersion} · Native Vulkan lib not bundled (CPU Safe)"
+                else -> {
+                    val reason = vulkanProbe.reason ?: engineCapabilities.gpuUnavailableReason ?: vulkanProbe.status.label
+                    "$reason · CPU Safe"
+                }
             }
 
             DeviceHardwareProfile(
@@ -93,10 +163,11 @@ class HardwareCapabilityManager(private val context: Context) {
                 cpuClusters = clusters,
                 hasSystemVulkan = hasVulkan,
                 hasSystemNnapi = hasNnapi,
-                activeBackendGpuSupported = engineCapabilities.supportsGpuOffload,
+                activeBackendGpuSupported = vulkanProbe.isUsableForInference || engineCapabilities.supportsGpuOffload,
                 activeBackendNpuSupported = engineCapabilities.supportsNpuOffload,
                 gpuStatusSummary = gpuSummary,
-                liveMetrics = metrics
+                liveMetrics = metrics,
+                vulkanCapabilities = vulkanProbe
             )
         }
 
@@ -109,21 +180,8 @@ class HardwareCapabilityManager(private val context: Context) {
         val totalMb = (memInfo.totalMem / (1024L * 1024L)).coerceAtLeast(0L)
         val availMb = (memInfo.availMem / (1024L * 1024L)).coerceAtLeast(0L)
 
-        val thermal = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-            when (pm?.currentThermalStatus) {
-                PowerManager.THERMAL_STATUS_NONE -> ThermalSeverity.NOMINAL
-                PowerManager.THERMAL_STATUS_LIGHT -> ThermalSeverity.LIGHT
-                PowerManager.THERMAL_STATUS_MODERATE -> ThermalSeverity.MODERATE
-                PowerManager.THERMAL_STATUS_SEVERE -> ThermalSeverity.SEVERE
-                PowerManager.THERMAL_STATUS_CRITICAL,
-                PowerManager.THERMAL_STATUS_EMERGENCY,
-                PowerManager.THERMAL_STATUS_SHUTDOWN -> ThermalSeverity.CRITICAL
-                else -> ThermalSeverity.UNAVAILABLE
-            }
-        } else {
-            ThermalSeverity.UNAVAILABLE
-        }
+        val thermal = readCurrentThermalStatus()
+        _thermalSeverityFlow.value = thermal
 
         return LiveDeviceMetrics(
             totalRamMb = totalMb,
@@ -131,6 +189,24 @@ class HardwareCapabilityManager(private val context: Context) {
             lowMemory = memInfo.lowMemory,
             thermalSeverity = thermal
         )
+    }
+
+    private fun readCurrentThermalStatus(): ThermalSeverity {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return ThermalSeverity.UNAVAILABLE
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return ThermalSeverity.UNAVAILABLE
+        val status = runCatching { pm.currentThermalStatus }.getOrNull() ?: return ThermalSeverity.UNAVAILABLE
+        return mapPowerThermalStatus(status)
+    }
+
+    private fun mapPowerThermalStatus(status: Int): ThermalSeverity = when (status) {
+        PowerManager.THERMAL_STATUS_NONE -> ThermalSeverity.NOMINAL
+        PowerManager.THERMAL_STATUS_LIGHT -> ThermalSeverity.LIGHT
+        PowerManager.THERMAL_STATUS_MODERATE -> ThermalSeverity.MODERATE
+        PowerManager.THERMAL_STATUS_SEVERE -> ThermalSeverity.SEVERE
+        PowerManager.THERMAL_STATUS_CRITICAL,
+        PowerManager.THERMAL_STATUS_EMERGENCY,
+        PowerManager.THERMAL_STATUS_SHUTDOWN -> ThermalSeverity.CRITICAL
+        else -> ThermalSeverity.UNAVAILABLE
     }
 
     private fun readCpuFeatures(): Set<String> {
@@ -153,53 +229,5 @@ class HardwareCapabilityManager(private val context: Context) {
         if ("sve" in tokens) detected += "SVE"
         if ("avx2" in tokens) detected += "AVX2"
         return detected
-    }
-
-    private fun readCpuClusters(): CpuClusterSummary {
-        val coreCount = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
-        val freqsKhz = mutableListOf<Int>()
-        for (cpuIdx in 0 until coreCount) {
-            val freqFile = File("/sys/devices/system/cpu/cpu$cpuIdx/cpufreq/cpuinfo_max_freq")
-            val freq = runCatching {
-                freqFile.takeIf { it.canRead() }?.readText()?.trim()?.toIntOrNull()
-            }.getOrNull()
-            if (freq != null && freq > 0) {
-                freqsKhz += freq
-            }
-        }
-        if (freqsKhz.isEmpty()) {
-            return CpuClusterSummary(
-                primeCores = 0,
-                performanceCores = 0,
-                efficiencyCores = 0,
-                totalCores = coreCount,
-                maxFreqMhz = 0
-            )
-        }
-        val distinctDesc = freqsKhz.distinct().sortedDescending()
-        val maxKhz = distinctDesc.first()
-        val maxMhz = maxKhz / 1000
-        return when {
-            distinctDesc.size >= 3 -> {
-                val primeFreq = distinctDesc[0]
-                val effFreq = distinctDesc.last()
-                val prime = freqsKhz.count { it == primeFreq }
-                val eff = freqsKhz.count { it == effFreq }
-                val mid = freqsKhz.size - prime - eff
-                CpuClusterSummary(prime, mid, eff, coreCount, maxMhz)
-            }
-            distinctDesc.size == 2 -> {
-                val perfFreq = distinctDesc[0]
-                val effFreq = distinctDesc[1]
-                CpuClusterSummary(
-                    primeCores = 0,
-                    performanceCores = freqsKhz.count { it == perfFreq },
-                    efficiencyCores = freqsKhz.count { it == effFreq },
-                    totalCores = coreCount,
-                    maxFreqMhz = maxMhz
-                )
-            }
-            else -> CpuClusterSummary(0, freqsKhz.size, 0, coreCount, maxMhz)
-        }
     }
 }

@@ -16,6 +16,11 @@ interface InferenceBackend {
     suspend fun cancel()
     suspend fun unload()
     suspend fun benchmark(prefillTokens: Int = 64, decodeTokens: Int = 32): BenchmarkResult
+    suspend fun benchmarkWithThreads(
+        threads: Int,
+        prefillTokens: Int = 48,
+        decodeTokens: Int = 20
+    ): BenchmarkResult = benchmark(prefillTokens, decodeTokens)
 
     suspend fun tokenize(text: String): IntArray
     suspend fun detokenize(tokens: IntArray): String

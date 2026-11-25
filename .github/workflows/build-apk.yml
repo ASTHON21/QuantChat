@@ -79,6 +79,49 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Install Host Vulkan Shader Tools & Android NDK
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libvulkan-dev vulkan-tools
+          # Install Android NDK + shaderc/glslc if needed
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
+          NDK_VERSION="27.2.12479018"
+          if [ ! -d "$SDK_ROOT/ndk/$NDK_VERSION" ] && [ -n "$SDKMANAGER" ]; then
+            "$SDKMANAGER" --install "ndk;$NDK_VERSION" "cmake;3.31.5" >/dev/null
+          fi
+          echo "NDK_DIR=$SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build arm64-v8a llama.cpp Vulkan Native Library
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLAMA_DIR="/tmp/llama.cpp"
+          if [ ! -d "$LLAMA_DIR" ]; then
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$LLAMA_DIR"
+          fi
+
+          # Ensure glslc from Android NDK shaderc or system is on PATH
+          SHADERC_BIN_DIR="$(dirname "$(find "$NDK_DIR/shader-tools" -name glslc -type f 2>/dev/null | head -n 1 || true)")"
+          if [ -n "$SHADERC_BIN_DIR" ] && [ -d "$SHADERC_BIN_DIR" ]; then
+            export PATH="$SHADERC_BIN_DIR:$PATH"
+          fi
+          which glslc
+
+          cmake -S engine-vulkan/src/main/cpp -B /tmp/vulkan-arm64 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_DIR}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_CPP_DIR="$LLAMA_DIR"
+          cmake --build /tmp/vulkan-arm64 --target quantchat_vulkan -j"$(nproc)"
+
+          mkdir -p engine-vulkan/src/main/jniLibs/arm64-v8a
+          cp /tmp/vulkan-arm64/libquantchat_vulkan.so engine-vulkan/src/main/jniLibs/arm64-v8a/libquantchat_vulkan.so
+          ls -lh engine-vulkan/src/main/jniLibs/arm64-v8a/libquantchat_vulkan.so
+
       - name: Run unit tests
         run: gradle :app:testDebugUnitTest --no-daemon
 
@@ -154,7 +197,7 @@ jobs:
               f"| Version | `{ver_name}` (Build `{ver_code}`) |",
               f"| Commit | `{sha}` |",
               "| Android SDK | Min API 24 / Target API 36 |",
-              "| Native Engine | `llama.cpp` (`llamacpp-kotlin 0.4.0`, `arm64-v8a` / `x86_64`) |",
+              "| Native Engine | `llama.cpp` CPU (`llamacpp-kotlin 0.4.0`, `arm64-v8a`/`x86_64`) + Vulkan GPU (`arm64-v8a`, auto CPU fallback) |",
               "",
           ]
           if section:

@@ -26,12 +26,17 @@ import com.example.data.LocalWeightFile
 import com.example.data.ModelFileArtifact
 import com.example.data.local.AppChatDatabase
 import com.example.data.local.ChatRepository
+import com.quantchat.engine.core.AcceleratorBackendType
+import com.quantchat.engine.core.AcceleratorPreference
 import com.quantchat.engine.core.ChatTurn
+import com.quantchat.engine.core.CpuScheduleMode
 import com.quantchat.engine.core.EngineError
 import com.quantchat.engine.core.GenerationEvent
 import com.quantchat.engine.core.InferenceBackend
 import com.quantchat.engine.core.ModelId
 import com.quantchat.engine.llamacpp.LlamaCppBackend
+import com.quantchat.engine.vulkan.VulkanLlamaBackend
+import com.quantchat.engine.vulkan.VulkanNativeBridge
 import com.quantchat.hardware.HardwareCapabilityManager
 import com.quantchat.integration.LaunchAction
 import com.quantchat.integration.SystemIntegrationBridge
@@ -81,21 +86,27 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         AppChatDatabase.getInstance(appContext).chatDao()
     )
 
-    private val inferenceBackend: InferenceBackend = LlamaCppBackend(appContext.contentResolver)
-    private val hardwareManager = HardwareCapabilityManager(appContext)
+    private val cpuBackend: InferenceBackend = LlamaCppBackend(appContext.contentResolver)
+    private val vulkanBackend: InferenceBackend = VulkanLlamaBackend()
+    private val hardwareManager = HardwareCapabilityManager(
+        context = appContext,
+        vulkanNativeProbe = { VulkanNativeBridge.probeVulkanCapabilities() }
+    )
     private val resourceManager = RuntimeResourceManager(hardwareManager)
     private val modelRegistry = LocalModelRegistry(hfRepository.modelsDirectory)
     private val sessionManager = SessionCacheManager(File(appContext.filesDir, "sessions"))
 
     private val orchestrator = RuntimeOrchestrator(
-        backend = inferenceBackend,
+        primaryBackend = cpuBackend,
         hardwareManager = hardwareManager,
         resourceManager = resourceManager,
         modelRegistry = modelRegistry,
-        sessionManager = sessionManager
+        sessionManager = sessionManager,
+        vulkanBackend = vulkanBackend,
+        vulkanProbeProvider = { hardwareManager.probeVulkanCapabilities() }
     )
 
-    private val localHttpServer = LocalHttpServer(LocalOpenAiRouter(inferenceBackend))
+    private val localHttpServer = LocalHttpServer(LocalOpenAiRouter(orchestrator.backend))
 
     val orchestratorSnapshot: StateFlow<OrchestratorSnapshot> = orchestrator.snapshot
     val localServerState: StateFlow<LocalServerState> = localHttpServer.state
@@ -162,6 +173,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
     private var loadJob: Job? = null
     private var generationJob: Job? = null
     private var metadataJob: Job? = null
+    private var calibrationJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -175,6 +187,18 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             hfRepository.inferenceSettingsFlow.collect { settings ->
                 _inferenceSettings.value = settings
+                orchestrator.updateScheduleConfig(
+                    mode = settings.scheduleMode,
+                    autoThermalDownshift = settings.autoThermalDownshift,
+                    manualThreadsOverride = settings.manualThreadsOverride,
+                    calibratedOptimalThreads = settings.calibratedOptimalThreads,
+                    calibratedDeviceSignature = settings.calibratedDeviceSignature
+                )
+                orchestrator.updateAcceleratorConfig(
+                    preference = settings.acceleratorPreference,
+                    autoGpuLayerOffload = settings.autoGpuLayerOffload,
+                    manualGpuLayers = settings.manualGpuLayers
+                )
             }
         }
         refreshLocalWeights()
@@ -223,6 +247,38 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    fun runVulkanSelfTest() {
+        viewModelScope.launch {
+            val probe = orchestrator.runVulkanSelfTest()
+            _snackbarMessage.value = if (probe.isUsableForInference) {
+                "Vulkan verified: ${probe.deviceName ?: "GPU"} (${probe.vulkanApiVersionLabel ?: probe.systemVulkanVersion})"
+            } else {
+                "GPU probe: ${probe.status.label} — ${probe.reason ?: probe.selfTestSummary}"
+            }
+        }
+    }
+
+    fun selectAcceleratorPreference(preference: AcceleratorPreference) {
+        viewModelScope.launch {
+            val current = _inferenceSettings.value
+            val updated = current.copy(acceleratorPreference = preference)
+            hfRepository.saveInferenceSettings(updated)
+            orchestrator.updateAcceleratorConfig(
+                preference = updated.acceleratorPreference,
+                autoGpuLayerOffload = updated.autoGpuLayerOffload,
+                manualGpuLayers = updated.manualGpuLayers
+            )
+            val ready = _runtimeState.value as? LocalRuntimeState.Ready
+            if (ready != null && current.acceleratorPreference != preference) {
+                sessionManager.invalidateAll()
+                loadLocalModel(ready.file)
+                _snackbarMessage.value = "Switched backend preference to ${preference.label} — remapping ${ready.file.displayFileName}..."
+            } else {
+                _snackbarMessage.value = "Accelerator preference: ${preference.label}"
+            }
+        }
+    }
+
     fun runHardwareBenchmark() {
         if (_isGenerating.value) {
             _snackbarMessage.value = "Wait for active generation to finish before benchmarking."
@@ -247,6 +303,95 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                 Log.e(TAG, "Benchmark failed", e)
                 _snackbarMessage.value = e.localizedMessage ?: "Hardware benchmark failed."
             }
+        }
+    }
+
+    fun selectScheduleMode(mode: CpuScheduleMode) {
+        viewModelScope.launch {
+            val current = _inferenceSettings.value
+            val updated = current.copy(
+                scheduleMode = mode,
+                manualThreadsOverride = null
+            )
+            hfRepository.saveInferenceSettings(updated)
+            orchestrator.updateScheduleConfig(
+                mode = updated.scheduleMode,
+                autoThermalDownshift = updated.autoThermalDownshift,
+                manualThreadsOverride = updated.manualThreadsOverride,
+                calibratedOptimalThreads = updated.calibratedOptimalThreads,
+                calibratedDeviceSignature = updated.calibratedDeviceSignature
+            )
+            val resolved = orchestrator.snapshot.value.schedulingDecision
+            val activeLabel = resolved?.effectiveThreads ?: updated.threads
+            _snackbarMessage.value = if (resolved?.isThermallyThrottled == true) {
+                "Thermal protection active (${resolved.effectiveMode.label} · ${activeLabel}T)"
+            } else {
+                "CPU profile: ${mode.label} (${activeLabel}T, instant apply)"
+            }
+        }
+    }
+
+    fun toggleAutoThermalDownshift(enabled: Boolean) {
+        viewModelScope.launch {
+            val current = _inferenceSettings.value
+            val updated = current.copy(autoThermalDownshift = enabled)
+            hfRepository.saveInferenceSettings(updated)
+            orchestrator.updateScheduleConfig(
+                mode = updated.scheduleMode,
+                autoThermalDownshift = updated.autoThermalDownshift,
+                manualThreadsOverride = updated.manualThreadsOverride,
+                calibratedOptimalThreads = updated.calibratedOptimalThreads,
+                calibratedDeviceSignature = updated.calibratedDeviceSignature
+            )
+            _snackbarMessage.value = if (enabled) {
+                "Auto Thermal Safe protection enabled."
+            } else {
+                "Auto Thermal Safe protection disabled."
+            }
+        }
+    }
+
+    fun calibrateOptimalThreads() {
+        if (_isGenerating.value) {
+            _snackbarMessage.value = "Wait for active generation to finish before calibrating threads."
+            return
+        }
+        if (_runtimeState.value !is LocalRuntimeState.Ready) {
+            _snackbarMessage.value = "Load a local GGUF model first to calibrate optimal thread count."
+            return
+        }
+        if (orchestrator.snapshot.value.calibrationProgress.running) return
+
+        calibrationJob?.cancel()
+        calibrationJob = viewModelScope.launch {
+            try {
+                val result = orchestrator.calibrateOptimalThreads()
+                hfRepository.saveCalibratedThreads(result.optimalThreads, result.deviceSignature)
+                val bestEntry = result.entries.firstOrNull { it.threads == result.optimalThreads }
+                _snackbarMessage.value = if (bestEntry != null) {
+                    String.format(
+                        Locale.US,
+                        "Calibrated optimal: %dT (PP %.1f · TG %.1f tok/s)",
+                        result.optimalThreads,
+                        bestEntry.prefillTokPerSec,
+                        bestEntry.decodeTokPerSec
+                    )
+                } else {
+                    "Calibrated optimal threads: ${result.optimalThreads}T"
+                }
+            } catch (_: CancellationException) {
+                _snackbarMessage.value = "Thread calibration cancelled."
+            } catch (e: Exception) {
+                Log.e(TAG, "Thread calibration failed", e)
+                _snackbarMessage.value = e.localizedMessage ?: "Thread calibration failed."
+            }
+        }
+    }
+
+    fun cancelCalibration() {
+        viewModelScope.launch {
+            orchestrator.cancelCalibration()
+            calibrationJob?.cancel()
         }
     }
 
@@ -373,10 +518,16 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                     headerMetadata = outcome.headerMetadata
                 )
                 hfRepository.saveLastLoadedModel(file.diskFileName)
-                _snackbarMessage.value = if (outcome.admission.verdict == AdmissionVerdict.WARNING) {
-                    "Loaded ${file.displayFileName} (${outcome.admission.summary})"
-                } else {
-                    "Loaded ${file.displayFileName} into offline runtime."
+                val backendStatus = orchestrator.snapshot.value.backendRuntimeStatus
+                _snackbarMessage.value = when {
+                    backendStatus.fallbackOccurred ->
+                        "Vulkan fallback → safe CPU mode (${backendStatus.fallbackReason ?: "incompatible driver"})"
+                    backendStatus.activeBackend == AcceleratorBackendType.VULKAN_GPU ->
+                        "Loaded ${file.displayFileName} on ${backendStatus.activeDeviceLabel} (${backendStatus.appliedGpuLayers}/${backendStatus.totalModelLayers}L)"
+                    outcome.admission.verdict == AdmissionVerdict.WARNING ->
+                        "Loaded ${file.displayFileName} (${outcome.admission.summary})"
+                    else ->
+                        "Loaded ${file.displayFileName} into offline CPU runtime."
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -479,6 +630,7 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                     isStreaming = true
                 )
 
+                val wasFallbackBefore = orchestrator.snapshot.value.backendRuntimeStatus.fallbackOccurred
                 val settings = _inferenceSettings.value
                 val modelFamilyHint = "${readyState.file.repoId} ${readyState.file.displayFileName}"
                 orchestrator.streamChat(
@@ -534,6 +686,11 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
                         }
                     }
                 }
+                val afterStatus = orchestrator.snapshot.value.backendRuntimeStatus
+                if (!wasFallbackBefore && afterStatus.fallbackOccurred) {
+                    _snackbarMessage.value =
+                        "Vulkan fallback → CPU (${afterStatus.fallbackReason ?: "auto failover"})"
+                }
             } catch (e: CancellationException) {
                 _streamingMessage.value = null
                 throw e
@@ -575,23 +732,49 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
     fun updateInferenceSettings(newSettings: InferenceSettings) {
         val oldSettings = _inferenceSettings.value
         viewModelScope.launch {
-            hfRepository.saveInferenceSettings(newSettings)
-            val needsReload = (oldSettings.threads != newSettings.threads ||
-                oldSettings.contextSize != newSettings.contextSize)
-            if (needsReload || oldSettings.systemPrompt != newSettings.systemPrompt) {
+            orchestrator.updateScheduleConfig(
+                mode = newSettings.scheduleMode,
+                autoThermalDownshift = newSettings.autoThermalDownshift,
+                manualThreadsOverride = newSettings.manualThreadsOverride,
+                calibratedOptimalThreads = newSettings.calibratedOptimalThreads,
+                calibratedDeviceSignature = newSettings.calibratedDeviceSignature
+            )
+            orchestrator.updateAcceleratorConfig(
+                preference = newSettings.acceleratorPreference,
+                autoGpuLayerOffload = newSettings.autoGpuLayerOffload,
+                manualGpuLayers = newSettings.manualGpuLayers
+            )
+            val resolvedThreads = orchestrator.snapshot.value.schedulingDecision?.effectiveThreads
+                ?: newSettings.manualThreadsOverride
+                ?: newSettings.threads
+            val syncedSettings = newSettings.copy(threads = resolvedThreads)
+            hfRepository.saveInferenceSettings(syncedSettings)
+
+            val accelChanged = oldSettings.acceleratorPreference != syncedSettings.acceleratorPreference ||
+                oldSettings.autoGpuLayerOffload != syncedSettings.autoGpuLayerOffload ||
+                (!syncedSettings.autoGpuLayerOffload && oldSettings.manualGpuLayers != syncedSettings.manualGpuLayers)
+            val needsReload = oldSettings.contextSize != syncedSettings.contextSize || accelChanged
+            if (needsReload || oldSettings.systemPrompt != syncedSettings.systemPrompt) {
                 sessionManager.invalidateAll()
             }
             val ready = _runtimeState.value as? LocalRuntimeState.Ready
             if (needsReload && ready != null) {
                 loadLocalModel(ready.file)
-                _snackbarMessage.value = "Settings saved — reloading ${ready.file.displayFileName}..."
+                _snackbarMessage.value = if (accelChanged) {
+                    "Accelerator/offload updated — remapping ${ready.file.displayFileName}..."
+                } else {
+                    "Context window updated — reloading ${ready.file.displayFileName}..."
+                }
             } else {
+                val decision = orchestrator.snapshot.value.schedulingDecision
+                val modeText = decision?.effectiveMode?.label ?: syncedSettings.scheduleMode.label
                 _snackbarMessage.value = String.format(
                     Locale.US,
-                    "Inference settings saved (T=%d, ctx=%d, temp=%.2f)",
-                    newSettings.threads,
-                    newSettings.contextSize,
-                    newSettings.temperature
+                    "Saved · %s (%dT), %s, ctx=%d",
+                    modeText,
+                    resolvedThreads,
+                    syncedSettings.acceleratorPreference.label,
+                    syncedSettings.contextSize
                 )
             }
             refreshLocalWeights()
@@ -901,8 +1084,10 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         loadJob?.cancel()
         generationJob?.cancel()
         metadataJob?.cancel()
+        calibrationJob?.cancel()
         hfRepository.cancelActiveHttpCall()
         localHttpServer.stop()
+        orchestrator.shutdown()
         CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
             orchestrator.unloadModel()
         }

@@ -19,10 +19,34 @@ object AppReleaseInfo {
 
     val changelog: List<ReleaseChangelogEntry> = listOf(
         ReleaseChangelogEntry(
+            version = "v1.4.0",
+            buildNumber = 5,
+            date = "2026-11-25",
+            badge = "CURRENT",
+            highlights = listOf(
+                "Phase 1.2: Added modular :engine-vulkan backend with C++17 JNI integration against llama.cpp ggml-vulkan and CI arm64-v8a cross-compilation.",
+                "Added 3-layer Vulkan capability probing (Android system features, GPU heap/16-bit/FP16 inspection, and live GPU buffer copy/operator self-test) with OpenCL documented as Phase 2.",
+                "Added ResilientFailoverBackend routing and automatic CPU failover on Vulkan probe, load, or pre-decode inference failures without breaking existing CPU inference.",
+                "Added unified Android RAM/VRAM auto GPU layer offload planner (n_gpu_layers) plus manual override slider, Chat GPU/CPU status pill, and GPU probe diagnostics."
+            )
+        ),
+        ReleaseChangelogEntry(
+            version = "v1.3.0",
+            buildNumber = 4,
+            date = "2026-11-25",
+            badge = "RELEASED",
+            highlights = listOf(
+                "Phase 1.1: Upgraded sysfs CPU topology inspection (/sys/devices/system/cpu/) to classify Prime / Big / LITTLE clusters via cpu_capacity and frequency fallback.",
+                "Added 4 adaptive CPU scheduling profiles (Eco, Balanced, Performance, Thermal Safe) with per-request dynamic n_threads injection and legal Process.setThreadPriority hints without reloading GGUF weights.",
+                "Added live PowerManager thermal status listener that automatically downshifts to Thermal Safe at Moderate+ device temperatures and restores when cooled.",
+                "Added 1-tap multi-thread benchmark calibration (Calibrate Optimal Threads) with DataStore device-signature persistence and clickable chat telemetry profile pill."
+            )
+        ),
+        ReleaseChangelogEntry(
             version = "v1.2.0",
             buildNumber = 3,
             date = "2026-11-25",
-            badge = "CURRENT",
+            badge = "RELEASED",
             highlights = listOf(
                 "Refactored runtime into 8 decoupled Gradle modules with unified InferenceBackend contracts and EngineLifecycleState.",
                 "Added real Android CPU SIMD/cluster topology, free RAM admission, thermal monitoring, and hardware Run Bench diagnostics.",

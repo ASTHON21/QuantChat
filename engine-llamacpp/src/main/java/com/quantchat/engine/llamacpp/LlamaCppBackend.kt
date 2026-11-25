@@ -4,6 +4,7 @@ import android.content.ContentResolver
 import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.util.Log
 import com.quantchat.engine.core.AcceleratorBackendType
 import com.quantchat.engine.core.BenchmarkResult
@@ -17,6 +18,7 @@ import com.quantchat.engine.core.EngineVersionInfo
 import com.quantchat.engine.core.GenerationEvent
 import com.quantchat.engine.core.GenerationRequest
 import com.quantchat.engine.core.InferenceBackend
+import com.quantchat.engine.core.InferenceThreadPriority
 import com.quantchat.engine.core.ModelConfig
 import com.quantchat.engine.core.ModelId
 import com.quantchat.engine.core.PromptTemplateFormatter
@@ -263,10 +265,11 @@ class LlamaCppBackend(
                             userPrompt = request.userPrompt
                         )
 
+                    val effectiveThreads = (request.threadsOverride ?: modelCfg.threads).coerceIn(1, 16)
                     val completionParams = mapOf<String, Any>(
                         "prompt" to formattedPrompt,
                         "n_predict" to request.maxTokens,
-                        "n_threads" to modelCfg.threads,
+                        "n_threads" to effectiveThreads,
                         "temperature" to request.temperature.toDouble(),
                         "top_k" to request.topK,
                         "top_p" to request.topP.toDouble(),
@@ -276,9 +279,14 @@ class LlamaCppBackend(
                         "stop" to request.stopTokens
                     )
 
+                    val prevPriority = runCatching { Process.getThreadPriority(Process.myTid()) }.getOrNull()
+                    applyLegalThreadPriority(request.threadPriority)
                     try {
                         llama.launchCompletion(ctxId, completionParams)
                     } finally {
+                        if (prevPriority != null) {
+                            runCatching { Process.setThreadPriority(prevPriority) }
+                        }
                         if (activeContextId == ctxId) {
                             _lifecycleState.value = EngineLifecycleState.Ready(
                                 modelId = modelCfg.modelId,
@@ -363,87 +371,112 @@ class LlamaCppBackend(
     }
 
     override suspend fun benchmark(prefillTokens: Int, decodeTokens: Int): BenchmarkResult =
-        withContext(Dispatchers.IO) {
-            engineMutex.withLock {
-                val ctxId = activeContextId
-                val modelCfg = activeModelConfig
-                if (ctxId == null || modelCfg == null) {
-                    throw EngineError.BackendInitFailed("Load a GGUF model before running hardware benchmark.")
+        benchmarkWithThreads(
+            threads = activeModelConfig?.threads ?: 4,
+            prefillTokens = prefillTokens,
+            decodeTokens = decodeTokens
+        )
+
+    override suspend fun benchmarkWithThreads(
+        threads: Int,
+        prefillTokens: Int,
+        decodeTokens: Int
+    ): BenchmarkResult = withContext(Dispatchers.IO) {
+        engineMutex.withLock {
+            val ctxId = activeContextId
+            val modelCfg = activeModelConfig
+            if (ctxId == null || modelCfg == null) {
+                throw EngineError.BackendInitFailed("Load a GGUF model before running hardware benchmark.")
+            }
+            val effectiveThreads = threads.coerceIn(1, 16)
+            _lifecycleState.value = EngineLifecycleState.Benchmarking(modelCfg.modelId)
+            val prevPriority = runCatching { Process.getThreadPriority(Process.myTid()) }.getOrNull()
+            applyLegalThreadPriority(InferenceThreadPriority.FAVORABLE)
+            try {
+                val syntheticPrompt = buildString {
+                    append("Benchmark sequence: ")
+                    repeat(prefillTokens.coerceIn(16, 128)) { idx ->
+                        append("token").append(idx % 17).append(' ')
+                    }
                 }
-                _lifecycleState.value = EngineLifecycleState.Benchmarking(modelCfg.modelId)
-                try {
-                    val syntheticPrompt = buildString {
-                        append("Benchmark sequence: ")
-                        repeat(prefillTokens.coerceIn(16, 128)) { idx ->
-                            append("token").append(idx % 17).append(' ')
-                        }
-                    }
 
-                    var firstTokenAtMs = 0L
-                    val benchStartMs = System.currentTimeMillis()
-                    activeTokenSink = { chunk ->
-                        if (firstTokenAtMs == 0L && chunk.isNotEmpty()) {
-                            firstTokenAtMs = System.currentTimeMillis()
-                        }
+                var firstTokenAtMs = 0L
+                val benchStartMs = System.currentTimeMillis()
+                activeTokenSink = { chunk ->
+                    if (firstTokenAtMs == 0L && chunk.isNotEmpty()) {
+                        firstTokenAtMs = System.currentTimeMillis()
                     }
+                }
 
-                    val targetDecode = decodeTokens.coerceIn(8, 64)
-                    val params = mapOf<String, Any>(
-                        "prompt" to syntheticPrompt,
-                        "n_predict" to targetDecode,
-                        "n_threads" to modelCfg.threads,
-                        "temperature" to 0.0,
-                        "emit_partial_completion" to true
+                val targetDecode = decodeTokens.coerceIn(8, 64)
+                val params = mapOf<String, Any>(
+                    "prompt" to syntheticPrompt,
+                    "n_predict" to targetDecode,
+                    "n_threads" to effectiveThreads,
+                    "temperature" to 0.0,
+                    "emit_partial_completion" to true
+                )
+
+                val result = llama.launchCompletion(ctxId, params)
+                val endMs = System.currentTimeMillis()
+                activeTokenSink = null
+
+                val actualPrefillTokens = runCatching { tokenizeInternal(ctxId, syntheticPrompt).size }
+                    .getOrDefault(prefillTokens)
+                    .coerceAtLeast(1)
+                val actualDecodeTokens = ((result?.get("tokens_predicted") as? Number)?.toInt() ?: targetDecode)
+                    .coerceAtLeast(1)
+
+                val totalMs = (endMs - benchStartMs).coerceAtLeast(1L)
+                val prefillMs = if (firstTokenAtMs > benchStartMs) {
+                    (firstTokenAtMs - benchStartMs).coerceAtLeast(1L)
+                } else {
+                    (totalMs / 3L).coerceAtLeast(1L)
+                }
+                val decodeMs = if (firstTokenAtMs in (benchStartMs + 1) until endMs) {
+                    (endMs - firstTokenAtMs).coerceAtLeast(1L)
+                } else {
+                    totalMs
+                }
+
+                val ppRate = (actualPrefillTokens * 1000f) / prefillMs.toFloat()
+                val tgRate = (actualDecodeTokens * 1000f) / decodeMs.toFloat()
+
+                BenchmarkResult(
+                    prefillTokensPerSec = ppRate,
+                    decodeTokensPerSec = tgRate,
+                    prefillTokens = actualPrefillTokens,
+                    decodeTokens = actualDecodeTokens,
+                    elapsedMs = totalMs,
+                    isNativeBench = false,
+                    notes = "Measured real completion (${effectiveThreads}T CPU)"
+                )
+            } finally {
+                if (prevPriority != null) {
+                    runCatching { Process.setThreadPriority(prevPriority) }
+                }
+                activeTokenSink = null
+                if (activeContextId == ctxId) {
+                    _lifecycleState.value = EngineLifecycleState.Ready(
+                        modelId = modelCfg.modelId,
+                        contextId = ctxId,
+                        config = modelCfg,
+                        activeSessionId = activeSessionId,
+                        modelDetails = activeModelDetails
                     )
-
-                    val result = llama.launchCompletion(ctxId, params)
-                    val endMs = System.currentTimeMillis()
-                    activeTokenSink = null
-
-                    val actualPrefillTokens = runCatching { tokenizeInternal(ctxId, syntheticPrompt).size }
-                        .getOrDefault(prefillTokens)
-                        .coerceAtLeast(1)
-                    val actualDecodeTokens = ((result?.get("tokens_predicted") as? Number)?.toInt() ?: targetDecode)
-                        .coerceAtLeast(1)
-
-                    val totalMs = (endMs - benchStartMs).coerceAtLeast(1L)
-                    val prefillMs = if (firstTokenAtMs > benchStartMs) {
-                        (firstTokenAtMs - benchStartMs).coerceAtLeast(1L)
-                    } else {
-                        (totalMs / 3L).coerceAtLeast(1L)
-                    }
-                    val decodeMs = if (firstTokenAtMs in (benchStartMs + 1) until endMs) {
-                        (endMs - firstTokenAtMs).coerceAtLeast(1L)
-                    } else {
-                        totalMs
-                    }
-
-                    val ppRate = (actualPrefillTokens * 1000f) / prefillMs.toFloat()
-                    val tgRate = (actualDecodeTokens * 1000f) / decodeMs.toFloat()
-
-                    BenchmarkResult(
-                        prefillTokensPerSec = ppRate,
-                        decodeTokensPerSec = tgRate,
-                        prefillTokens = actualPrefillTokens,
-                        decodeTokens = actualDecodeTokens,
-                        elapsedMs = totalMs,
-                        isNativeBench = false,
-                        notes = "Measured real completion TTFT/decode (${modelCfg.threads}T CPU)"
-                    )
-                } finally {
-                    activeTokenSink = null
-                    if (activeContextId == ctxId) {
-                        _lifecycleState.value = EngineLifecycleState.Ready(
-                            modelId = modelCfg.modelId,
-                            contextId = ctxId,
-                            config = modelCfg,
-                            activeSessionId = activeSessionId,
-                            modelDetails = activeModelDetails
-                        )
-                    }
                 }
             }
         }
+    }
+
+    private fun applyLegalThreadPriority(priority: InferenceThreadPriority) {
+        val target = when (priority) {
+            InferenceThreadPriority.BACKGROUND -> Process.THREAD_PRIORITY_BACKGROUND
+            InferenceThreadPriority.DEFAULT -> Process.THREAD_PRIORITY_DEFAULT
+            InferenceThreadPriority.FAVORABLE -> Process.THREAD_PRIORITY_MORE_FAVORABLE
+        }
+        runCatching { Process.setThreadPriority(target) }
+    }
 
     override suspend fun tokenize(text: String): IntArray = withContext(Dispatchers.IO) {
         engineMutex.withLock {

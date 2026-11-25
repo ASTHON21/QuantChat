@@ -13,6 +13,69 @@ enum class AcceleratorBackendType(val label: String) {
     NPU("NPU")
 }
 
+enum class AcceleratorPreference(val label: String, val description: String) {
+    AUTO(
+        "Auto (Vulkan → CPU)",
+        "Probe Vulkan GPU automatically; safely fall back to CPU on any incompatibility."
+    ),
+    PREFER_VULKAN(
+        "Prefer Vulkan",
+        "Always probe and attempt Vulkan GPU first; still falls back to CPU if unsafe."
+    ),
+    CPU_ONLY(
+        "CPU Only",
+        "Bypass GPU offload and run exclusively on tuned CPU clusters."
+    )
+}
+
+enum class VulkanProbeStatus(val label: String) {
+    AVAILABLE("Vulkan Ready"),
+    UNSUPPORTED_DEVICE("No Device Vulkan"),
+    DRIVER_CAPABILITY_MISSING("Driver Capability Missing"),
+    NATIVE_LIBRARY_MISSING("Native Lib Not Bundled"),
+    PROBE_FAILED("Probe Failed")
+}
+
+data class VulkanProbeResult(
+    val status: VulkanProbeStatus,
+    val nativeLibraryLoaded: Boolean = false,
+    val systemVulkanSupported: Boolean = false,
+    val systemVulkanVersion: String = "Unavailable",
+    val deviceName: String? = null,
+    val vendorLabel: String? = null,
+    val driverVersionLabel: String? = null,
+    val vulkanApiVersionLabel: String? = null,
+    val supports16BitStorage: Boolean = false,
+    val supportsFp16Compute: Boolean = false,
+    val supportsCooperativeMatrix: Boolean = false,
+    val deviceLocalHeapMb: Long = 0L,
+    val hostVisibleHeapMb: Long = 0L,
+    val recommendedMaxOffloadMb: Long = 0L,
+    val bufferTransferSelfTestPassed: Boolean = false,
+    val operatorSelfTestPassed: Boolean = false,
+    val selfTestSummary: String = "Not probed",
+    val reason: String? = null,
+    val probedAtMs: Long = System.currentTimeMillis()
+) {
+    val isUsableForInference: Boolean
+        get() = status == VulkanProbeStatus.AVAILABLE &&
+            nativeLibraryLoaded &&
+            bufferTransferSelfTestPassed &&
+            operatorSelfTestPassed
+}
+
+data class BackendRuntimeStatus(
+    val activeBackend: AcceleratorBackendType = AcceleratorBackendType.CPU,
+    val requestedPreference: AcceleratorPreference = AcceleratorPreference.AUTO,
+    val requestedGpuLayers: Int = 0,
+    val appliedGpuLayers: Int = 0,
+    val totalModelLayers: Int = 0,
+    val fallbackOccurred: Boolean = false,
+    val statusSummary: String = "CPU Runtime",
+    val fallbackReason: String? = null,
+    val activeDeviceLabel: String = "CPU"
+)
+
 data class EngineVersionInfo(
     val backendId: String,
     val engineName: String,
@@ -106,6 +169,12 @@ sealed class EngineError(
         cause: Throwable? = null
     ) : EngineError(reason, cause)
 
+    class GpuBackendError(
+        val reason: String,
+        val fallbackEligible: Boolean = true,
+        cause: Throwable? = null
+    ) : EngineError(reason, cause)
+
     class ContextOverflow(
         val promptTokens: Int,
         val contextLimit: Int
@@ -147,6 +216,7 @@ data class ModelConfig(
     val batchSize: Int = 512,
     val threads: Int = 4,
     val gpuLayers: Int = 0,
+    val totalLayers: Int = 0,
     val useMmap: Boolean = true,
     val useMlock: Boolean = false,
     val enableEmbedding: Boolean = false
@@ -156,6 +226,25 @@ data class ChatTurn(
     val role: String,
     val content: String
 )
+
+enum class CpuScheduleMode(val label: String, val scenarioHint: String) {
+    ECO("Eco", "少量效率核 · 后台轻量"),
+    BALANCED("Balanced", "混合核心 · 普通聊天"),
+    PERFORMANCE("Performance", "高性能核 · 长文本"),
+    THERMAL_SAFE("Thermal Safe", "动态降线程 · 高温保护")
+}
+
+enum class WorkloadClass(val label: String) {
+    LIGHT("Light"),
+    STANDARD("Standard"),
+    LONG_CONTEXT("Long Context")
+}
+
+enum class InferenceThreadPriority(val label: String) {
+    BACKGROUND("Background"),
+    DEFAULT("Standard"),
+    FAVORABLE("Favorable")
+}
 
 data class GenerationRequest(
     val modelId: ModelId,
@@ -170,6 +259,8 @@ data class GenerationRequest(
     val topP: Float = 0.92f,
     val minP: Float = 0.05f,
     val repeatPenalty: Float = 1.1f,
+    val threadsOverride: Int? = null,
+    val threadPriority: InferenceThreadPriority = InferenceThreadPriority.DEFAULT,
     val stopTokens: List<String> = DEFAULT_STOP_TOKENS
 ) {
     companion object {

@@ -1,5 +1,7 @@
 package com.example.data
 
+import com.quantchat.engine.core.AcceleratorPreference
+import com.quantchat.engine.core.CpuScheduleMode
 import com.quantchat.engine.core.EngineModelDetails
 import com.quantchat.model.GgufHeaderMetadata
 import com.quantchat.resource.AdmissionAssessment
@@ -48,7 +50,15 @@ data class InferenceSettings(
     val contextSize: Int = 2048,
     val maxTokens: Int = 512,
     val temperature: Float = 0.3f,
-    val lastLoadedDiskFileName: String? = null
+    val lastLoadedDiskFileName: String? = null,
+    val scheduleMode: CpuScheduleMode = CpuScheduleMode.BALANCED,
+    val autoThermalDownshift: Boolean = true,
+    val manualThreadsOverride: Int? = null,
+    val calibratedOptimalThreads: Int? = null,
+    val calibratedDeviceSignature: String? = null,
+    val acceleratorPreference: AcceleratorPreference = AcceleratorPreference.AUTO,
+    val autoGpuLayerOffload: Boolean = true,
+    val manualGpuLayers: Int = 0
 ) {
     companion object {
         const val DEFAULT_SYSTEM_PROMPT =

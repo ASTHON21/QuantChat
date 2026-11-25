@@ -33,6 +33,7 @@ rootProject.name = "QuantChat"
 include(":app")
 include(":engine-core")
 include(":engine-llamacpp")
+include(":engine-vulkan")
 include(":hardware-manager")
 include(":resource-manager")
 include(":model-manager")
