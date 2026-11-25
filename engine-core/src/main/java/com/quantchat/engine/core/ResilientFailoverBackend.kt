@@ -17,8 +17,11 @@ class ResilientFailoverBackend(
             status = VulkanProbeStatus.NATIVE_LIBRARY_MISSING,
             reason = "No Vulkan backend configured."
         )
-    }
+    },
+    private val npuBackend: NpuInferenceBackend? = null
 ) : InferenceBackend {
+
+    fun npuInferenceBackend(): NpuInferenceBackend? = npuBackend
 
     private val routeMutex = Mutex()
 

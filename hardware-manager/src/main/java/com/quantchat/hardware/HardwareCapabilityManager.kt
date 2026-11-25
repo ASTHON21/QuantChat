@@ -6,6 +6,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.PowerManager
 import com.quantchat.engine.core.EngineCapabilities
+import com.quantchat.engine.core.NpuNativeRuntimeProbe
+import com.quantchat.engine.core.NpuProbeResult
 import com.quantchat.engine.core.VulkanProbeResult
 import com.quantchat.engine.core.VulkanProbeStatus
 import kotlinx.coroutines.Dispatchers
@@ -68,6 +70,7 @@ data class DeviceHardwareProfile(
     val gpuStatusSummary: String,
     val liveMetrics: LiveDeviceMetrics,
     val vulkanCapabilities: VulkanProbeResult? = null,
+    val npuCapabilities: NpuProbeResult? = null,
     val openClStatusNote: String = "OpenCL deferred to Phase 2 compatibility track"
 ) {
     val deviceTopologySignature: String
@@ -76,7 +79,8 @@ data class DeviceHardwareProfile(
 
 class HardwareCapabilityManager(
     private val context: Context,
-    private val vulkanNativeProbe: (suspend () -> VulkanProbeResult)? = null
+    private val vulkanNativeProbe: (suspend () -> VulkanProbeResult)? = null,
+    private val npuNativeProbe: (suspend () -> NpuNativeRuntimeProbe)? = null
 ) {
 
     private val _thermalSeverityFlow = MutableStateFlow(readCurrentThermalStatus())
@@ -125,6 +129,10 @@ class HardwareCapabilityManager(
         VulkanCapabilityProbe.probe(context, vulkanNativeProbe)
     }
 
+    suspend fun probeNpuCapabilities(): NpuProbeResult = withContext(Dispatchers.IO) {
+        NpuCapabilityProbe.probe(context, npuNativeProbe)
+    }
+
     suspend fun probeHardware(engineCapabilities: EngineCapabilities): DeviceHardwareProfile =
         withContext(Dispatchers.IO) {
             val abis = Build.SUPPORTED_ABIS?.toList().orEmpty()
@@ -138,9 +146,10 @@ class HardwareCapabilityManager(
             val cpuFlags = readCpuFeatures()
             val clusters = CpuTopologyParser.probeFromSysfs()
             val vulkanProbe = VulkanCapabilityProbe.probe(context, vulkanNativeProbe)
+            val npuProbe = NpuCapabilityProbe.probe(context, npuNativeProbe)
             val hasVulkan = vulkanProbe.systemVulkanSupported ||
                 context.packageManager.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
-            val hasNnapi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1
+            val hasNnapi = npuProbe.supportsNnapi || Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1
             val metrics = currentMemoryAndThermalSnapshot()
 
             val gpuSummary = when {
@@ -164,10 +173,11 @@ class HardwareCapabilityManager(
                 hasSystemVulkan = hasVulkan,
                 hasSystemNnapi = hasNnapi,
                 activeBackendGpuSupported = vulkanProbe.isUsableForInference || engineCapabilities.supportsGpuOffload,
-                activeBackendNpuSupported = engineCapabilities.supportsNpuOffload,
+                activeBackendNpuSupported = npuProbe.isVendorRuntimeReady && engineCapabilities.supportsNpuOffload,
                 gpuStatusSummary = gpuSummary,
                 liveMetrics = metrics,
-                vulkanCapabilities = vulkanProbe
+                vulkanCapabilities = vulkanProbe,
+                npuCapabilities = npuProbe
             )
         }
 

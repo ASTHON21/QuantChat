@@ -15,6 +15,9 @@ import com.quantchat.engine.core.GenerationRequest
 import com.quantchat.engine.core.InferenceBackend
 import com.quantchat.engine.core.ModelConfig
 import com.quantchat.engine.core.ModelId
+import com.quantchat.engine.core.NpuCompatibilityReport
+import com.quantchat.engine.core.NpuInferenceBackend
+import com.quantchat.engine.core.NpuProbeResult
 import com.quantchat.engine.core.ResilientFailoverBackend
 import com.quantchat.engine.core.VulkanProbeResult
 import com.quantchat.engine.core.WorkloadClass
@@ -66,7 +69,9 @@ data class OrchestratorSnapshot(
     val gpuOffloadPlan: GpuOffloadPlan? = null,
     val acceleratorPreference: AcceleratorPreference = AcceleratorPreference.AUTO,
     val autoGpuLayerOffload: Boolean = true,
-    val manualGpuLayers: Int = 0
+    val manualGpuLayers: Int = 0,
+    val npuCapabilities: NpuProbeResult? = null,
+    val npuCompatibilityReport: NpuCompatibilityReport? = null
 )
 
 data class ModelLoadOutcome(
@@ -82,7 +87,8 @@ class RuntimeOrchestrator(
     private val modelRegistry: LocalModelRegistry,
     private val sessionManager: SessionCacheManager,
     vulkanBackend: InferenceBackend? = null,
-    vulkanProbeProvider: (suspend () -> VulkanProbeResult)? = null
+    vulkanProbeProvider: (suspend () -> VulkanProbeResult)? = null,
+    private val npuBackend: NpuInferenceBackend? = null
 ) {
     private val resilientBackend: ResilientFailoverBackend = if (primaryBackend is ResilientFailoverBackend) {
         primaryBackend
@@ -90,7 +96,8 @@ class RuntimeOrchestrator(
         ResilientFailoverBackend(
             fallbackCpuBackend = primaryBackend,
             primaryGpuBackend = vulkanBackend,
-            probeProvider = vulkanProbeProvider ?: { hardwareManager.probeVulkanCapabilities() }
+            probeProvider = vulkanProbeProvider ?: { hardwareManager.probeVulkanCapabilities() },
+            npuBackend = npuBackend
         )
     }
 
@@ -110,6 +117,8 @@ class RuntimeOrchestrator(
     private var acceleratorPreference: AcceleratorPreference = AcceleratorPreference.AUTO
     private var autoGpuLayerOffload: Boolean = true
     private var manualGpuLayers: Int = 0
+    private var activeModelId: String? = null
+    private var activeModelFilePath: String? = null
     private var activeModelFileSizeBytes: Long = 0L
     private var activeModelHeader: GgufHeaderMetadata? = null
     private var activeModelContextSize: Int = 2048
@@ -194,9 +203,16 @@ class RuntimeOrchestrator(
         return result
     }
 
+    suspend fun runNpuProbe(): NpuProbeResult {
+        val result = hardwareManager.probeNpuCapabilities()
+        refreshDiagnostics()
+        return result
+    }
+
     suspend fun refreshDiagnostics(): DeviceHardwareProfile {
         val profile = hardwareManager.probeHardware(resilientBackend.capabilities)
         val probe = profile.vulkanCapabilities ?: resilientBackend.lastProbeResult.value
+        val npuProbe = profile.npuCapabilities
         _snapshot.update { current ->
             val decision = computeDecisionLocked(
                 profile = profile,
@@ -205,6 +221,7 @@ class RuntimeOrchestrator(
             )
             val previews = computeModePreviewsLocked(profile, profile.liveMetrics.thermalSeverity)
             val offloadPlan = computeOffloadPlanLocked(profile.liveMetrics, probe)
+            val compatReport = computeCompatibilityReportLocked(npuProbe, probe)
             current.copy(
                 lifecycleState = resilientBackend.lifecycleState.value,
                 versionInfo = resilientBackend.versionInfo,
@@ -221,7 +238,9 @@ class RuntimeOrchestrator(
                 gpuOffloadPlan = offloadPlan,
                 acceleratorPreference = acceleratorPreference,
                 autoGpuLayerOffload = autoGpuLayerOffload,
-                manualGpuLayers = manualGpuLayers
+                manualGpuLayers = manualGpuLayers,
+                npuCapabilities = npuProbe,
+                npuCompatibilityReport = compatReport
             )
         }
         return profile
@@ -260,12 +279,15 @@ class RuntimeOrchestrator(
         val initThreads = (decision.effectiveThreads.takeIf { it > 0 } ?: threads).coerceIn(1, 16)
 
         synchronized(configLock) {
+            activeModelId = modelId.value
+            activeModelFilePath = diskFile.absolutePath
             activeModelFileSizeBytes = diskFile.length()
             activeModelHeader = header
             activeModelContextSize = contextSize
         }
 
         val probe = profile.vulkanCapabilities ?: resilientBackend.probeVulkan()
+        val npuProbe = profile.npuCapabilities ?: hardwareManager.probeNpuCapabilities()
         val offloadPlan = computeOffloadPlanLocked(live, probe)
 
         val config = ModelConfig(
@@ -287,6 +309,8 @@ class RuntimeOrchestrator(
             resilientBackend.loadModel(config)
         } finally {
             val postMetrics = resourceManager.liveMetrics()
+            val finalProbe = resilientBackend.lastProbeResult.value ?: probe
+            val compatReport = computeCompatibilityReportLocked(npuProbe, finalProbe)
             _snapshot.update {
                 it.copy(
                     lifecycleState = resilientBackend.lifecycleState.value,
@@ -299,8 +323,10 @@ class RuntimeOrchestrator(
                     modeThreadPreview = computeModePreviewsLocked(profile, postMetrics.thermalSeverity),
                     lastAdmission = admission,
                     backendRuntimeStatus = resilientBackend.runtimeStatus.value,
-                    vulkanCapabilities = resilientBackend.lastProbeResult.value ?: probe,
-                    gpuOffloadPlan = offloadPlan
+                    vulkanCapabilities = finalProbe,
+                    gpuOffloadPlan = offloadPlan,
+                    npuCapabilities = npuProbe,
+                    npuCompatibilityReport = compatReport
                 )
             }
         }
@@ -433,6 +459,8 @@ class RuntimeOrchestrator(
         operationMutex.withLock {
             resilientBackend.unload()
             synchronized(configLock) {
+                activeModelId = null
+                activeModelFilePath = null
                 activeModelFileSizeBytes = 0L
                 activeModelHeader = null
             }
@@ -447,7 +475,8 @@ class RuntimeOrchestrator(
                     lastContextBudget = null,
                     liveMetrics = metrics,
                     backendRuntimeStatus = resilientBackend.runtimeStatus.value,
-                    gpuOffloadPlan = computeOffloadPlanLocked(metrics, probe)
+                    gpuOffloadPlan = computeOffloadPlanLocked(metrics, probe),
+                    npuCompatibilityReport = null
                 )
             }
         }
@@ -677,7 +706,9 @@ class RuntimeOrchestrator(
         _snapshot.update { current ->
             val profile = current.hardwareProfile
             val probe = profile?.vulkanCapabilities ?: current.vulkanCapabilities
+            val npuProbe = profile?.npuCapabilities ?: current.npuCapabilities
             val offloadPlan = computeOffloadPlanLocked(metrics, probe)
+            val compatReport = computeCompatibilityReportLocked(npuProbe, probe)
             if (profile == null) {
                 current.copy(
                     lifecycleState = resilientBackend.lifecycleState.value,
@@ -688,7 +719,9 @@ class RuntimeOrchestrator(
                     gpuOffloadPlan = offloadPlan,
                     acceleratorPreference = acceleratorPreference,
                     autoGpuLayerOffload = autoGpuLayerOffload,
-                    manualGpuLayers = manualGpuLayers
+                    manualGpuLayers = manualGpuLayers,
+                    npuCapabilities = npuProbe,
+                    npuCompatibilityReport = compatReport
                 )
             } else {
                 val decision = computeDecisionLocked(profile, metrics.thermalSeverity, lastWorkload)
@@ -707,10 +740,35 @@ class RuntimeOrchestrator(
                     gpuOffloadPlan = offloadPlan,
                     acceleratorPreference = acceleratorPreference,
                     autoGpuLayerOffload = autoGpuLayerOffload,
-                    manualGpuLayers = manualGpuLayers
+                    manualGpuLayers = manualGpuLayers,
+                    npuCapabilities = npuProbe,
+                    npuCompatibilityReport = compatReport
                 )
             }
         }
+    }
+
+    private fun computeCompatibilityReportLocked(
+        npuProbe: NpuProbeResult?,
+        vulkanProbe: VulkanProbeResult?
+    ): NpuCompatibilityReport? = synchronized(configLock) {
+        val modelId = activeModelId ?: return@synchronized null
+        val path = activeModelFilePath ?: return@synchronized null
+        val routedTarget = if (acceleratorPreference != AcceleratorPreference.CPU_ONLY &&
+            vulkanProbe?.isUsableForInference == true
+        ) {
+            "Vulkan GPU (${vulkanProbe.deviceName ?: "GPU"})"
+        } else {
+            "CPU"
+        }
+        NpuCompatibilityEvaluator.evaluate(
+            modelId = modelId,
+            filePath = path,
+            header = activeModelHeader,
+            npuProbe = npuProbe,
+            routedFallbackTarget = routedTarget,
+            npuBackend = npuBackend ?: resilientBackend.npuInferenceBackend()
+        )
     }
 
     private fun computeOffloadPlanLocked(

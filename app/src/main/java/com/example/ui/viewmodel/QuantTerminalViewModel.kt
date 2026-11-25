@@ -34,6 +34,7 @@ import com.quantchat.engine.core.EngineError
 import com.quantchat.engine.core.GenerationEvent
 import com.quantchat.engine.core.InferenceBackend
 import com.quantchat.engine.core.ModelId
+import com.quantchat.engine.core.NpuInferenceBackend
 import com.quantchat.engine.llamacpp.LlamaCppBackend
 import com.quantchat.engine.vulkan.VulkanLlamaBackend
 import com.quantchat.engine.vulkan.VulkanNativeBridge
@@ -88,9 +89,11 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
 
     private val cpuBackend: InferenceBackend = LlamaCppBackend(appContext.contentResolver)
     private val vulkanBackend: InferenceBackend = VulkanLlamaBackend()
+    private val npuBackend = NpuInferenceBackend()
     private val hardwareManager = HardwareCapabilityManager(
         context = appContext,
-        vulkanNativeProbe = { VulkanNativeBridge.probeVulkanCapabilities() }
+        vulkanNativeProbe = { VulkanNativeBridge.probeVulkanCapabilities() },
+        npuNativeProbe = { VulkanNativeBridge.probeNpuRuntime() }
     )
     private val resourceManager = RuntimeResourceManager(hardwareManager)
     private val modelRegistry = LocalModelRegistry(hfRepository.modelsDirectory)
@@ -103,7 +106,8 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
         modelRegistry = modelRegistry,
         sessionManager = sessionManager,
         vulkanBackend = vulkanBackend,
-        vulkanProbeProvider = { hardwareManager.probeVulkanCapabilities() }
+        vulkanProbeProvider = { hardwareManager.probeVulkanCapabilities() },
+        npuBackend = npuBackend
     )
 
     private val localHttpServer = LocalHttpServer(LocalOpenAiRouter(orchestrator.backend))
@@ -255,6 +259,13 @@ class QuantTerminalViewModel(application: Application) : AndroidViewModel(applic
             } else {
                 "GPU probe: ${probe.status.label} — ${probe.reason ?: probe.selfTestSummary}"
             }
+        }
+    }
+
+    fun runNpuProbe() {
+        viewModelScope.launch {
+            val probe = orchestrator.runNpuProbe()
+            _snackbarMessage.value = "NPU probe: ${probe.summary}"
         }
     }
 

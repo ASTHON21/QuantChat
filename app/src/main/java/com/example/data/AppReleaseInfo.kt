@@ -19,10 +19,22 @@ object AppReleaseInfo {
 
     val changelog: List<ReleaseChangelogEntry> = listOf(
         ReleaseChangelogEntry(
+            version = "v1.5.0",
+            buildNumber = 6,
+            date = "2026-11-25",
+            badge = "CURRENT",
+            highlights = listOf(
+                "Phase 1.3: Added non-root Android NPU hardware detection (NpuCapabilityProbe) prioritizing Qualcomm Snapdragon Hexagon HTP (SM8xxx/SM7xxx generation hints) alongside MediaTek APU, Google Tensor TPU, Samsung Exynos NPU, and Android NNAPI.",
+                "Added vendor-agnostic NpuInferenceBackend & NpuVendorDriverAdapter abstraction in :engine-core with typed EngineError.NpuBackendError rejection for unbundled SDKs or incompatible artifacts.",
+                "Added optional JNI dlopen runtime check (libQnnHtp.so / libcdsprpc.so) in VulkanNativeBridge respecting non-root Android SELinux linker namespace boundaries.",
+                "Added NpuCompatibilityEvaluator & UI NPU Diagnostics / Compatibility Gate banners that automatically route .gguf weights to Vulkan GPU or CPU with clear operator/format explanations."
+            )
+        ),
+        ReleaseChangelogEntry(
             version = "v1.4.0",
             buildNumber = 5,
             date = "2026-11-25",
-            badge = "CURRENT",
+            badge = "RELEASED",
             highlights = listOf(
                 "Phase 1.2: Added modular :engine-vulkan backend with C++17 JNI integration against llama.cpp ggml-vulkan and CI arm64-v8a cross-compilation.",
                 "Added 3-layer Vulkan capability probing (Android system features, GPU heap/16-bit/FP16 inspection, and live GPU buffer copy/operator self-test) with OpenCL documented as Phase 2.",

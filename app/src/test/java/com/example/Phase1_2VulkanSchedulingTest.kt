@@ -339,7 +339,7 @@ class Phase1_2VulkanSchedulingTest {
             operatorSelfTestPassed = false,
             reason = "Driver lacks VK_KHR_16bit_storage"
         )
-        val failover1 = ResilientFailoverBackend(cpu1, gpu1) { badProbe }
+        val failover1 = ResilientFailoverBackend(cpu1, gpu1, probeProvider = { badProbe })
         failover1.loadModel(model)
         assertEquals(0, gpu1.loadCalls)
         assertEquals(1, cpu1.loadCalls)
@@ -351,7 +351,7 @@ class Phase1_2VulkanSchedulingTest {
         // 2. Probe passes, but Vulkan loadModel throws -> unloads GPU & loads CPU
         val cpu2 = FakeBackend(AcceleratorBackendType.CPU)
         val gpu2 = FakeBackend(AcceleratorBackendType.VULKAN_GPU, failOnLoad = EngineError.GpuBackendError("VRAM allocation OOM"))
-        val failover2 = ResilientFailoverBackend(cpu2, gpu2) { verifiedVulkanProbe() }
+        val failover2 = ResilientFailoverBackend(cpu2, gpu2, probeProvider = { verifiedVulkanProbe() })
         failover2.loadModel(model)
         assertEquals(1, gpu2.loadCalls)
         assertTrue(gpu2.unloadCalls >= 1)
@@ -362,7 +362,7 @@ class Phase1_2VulkanSchedulingTest {
         // 3. Vulkan load succeeds, then fails pre-decode -> seamless CPU failover mid-request
         val cpu3 = FakeBackend(AcceleratorBackendType.CPU)
         val gpu3 = FakeBackend(AcceleratorBackendType.VULKAN_GPU, failPreDecode = EngineError.GpuBackendError("Shader pipeline error"))
-        val failover3 = ResilientFailoverBackend(cpu3, gpu3) { verifiedVulkanProbe() }
+        val failover3 = ResilientFailoverBackend(cpu3, gpu3, probeProvider = { verifiedVulkanProbe() })
         failover3.loadModel(model)
         assertEquals(AcceleratorBackendType.VULKAN_GPU, failover3.runtimeStatus.value.activeBackend)
         assertEquals(24, failover3.runtimeStatus.value.appliedGpuLayers)
@@ -377,7 +377,7 @@ class Phase1_2VulkanSchedulingTest {
         // 4. CPU_ONLY bypasses Vulkan probe & GPU load completely
         val cpu4 = FakeBackend(AcceleratorBackendType.CPU)
         val gpu4 = FakeBackend(AcceleratorBackendType.VULKAN_GPU)
-        val failover4 = ResilientFailoverBackend(cpu4, gpu4) { verifiedVulkanProbe() }
+        val failover4 = ResilientFailoverBackend(cpu4, gpu4, probeProvider = { verifiedVulkanProbe() })
         failover4.setPreference(AcceleratorPreference.CPU_ONLY)
         failover4.loadModel(model)
         assertEquals(0, gpu4.loadCalls)
@@ -398,7 +398,7 @@ class Phase1_2VulkanSchedulingTest {
                 failOnLoad = EngineError.GpuBackendError("Simulated driver compile fault")
             )
             val probe = verifiedVulkanProbe()
-            val hw = HardwareCapabilityManager(context) { probe }
+            val hw = HardwareCapabilityManager(context, vulkanNativeProbe = { probe })
             val rm = RuntimeResourceManager(hw)
             val orch = RuntimeOrchestrator(
                 primaryBackend = cpu,

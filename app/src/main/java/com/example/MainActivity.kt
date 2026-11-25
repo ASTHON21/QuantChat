@@ -226,6 +226,8 @@ fun QuantChatApp(
                         hfAuthState = hfAuthState,
                         isOnline = isOnline,
                         isImportingLocalFile = isImportingLocalFile,
+                        npuCapabilities = orchestratorSnapshot.npuCapabilities,
+                        npuCompatibilityReport = orchestratorSnapshot.npuCompatibilityReport,
                         onSelectTab = viewModel::selectModelTab,
                         onSearchQueryChange = viewModel::updateModelSearchQuery,
                         onSearchHubClick = viewModel::searchHuggingFaceHub,
@@ -312,6 +314,7 @@ fun QuantChatApp(
             onCalibrateThreads = viewModel::calibrateOptimalThreads,
             onCancelCalibration = viewModel::cancelCalibration,
             onRunVulkanSelfTest = viewModel::runVulkanSelfTest,
+            onRunNpuProbe = viewModel::runNpuProbe,
             onDismiss = { showSettingsSheet = false },
             onApply = viewModel::updateInferenceSettings,
             onOpenVersionInfo = { showVersionSheet = true }

@@ -104,6 +104,8 @@ import com.example.ui.theme.QuantSurfaceHigh
 import com.example.ui.theme.QuantSurfaceLow
 import com.example.ui.theme.QuantSurfaceLowest
 import com.example.ui.theme.QuantTextStyles
+import com.quantchat.engine.core.NpuCompatibilityReport
+import com.quantchat.engine.core.NpuProbeResult
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -120,6 +122,8 @@ fun ModelsScreen(
     hfAuthState: HfAuthState,
     isOnline: Boolean,
     isImportingLocalFile: Boolean,
+    npuCapabilities: NpuProbeResult? = null,
+    npuCompatibilityReport: NpuCompatibilityReport? = null,
     onSelectTab: (HubModelTab) -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSearchHubClick: () -> Unit,
@@ -587,6 +591,8 @@ fun ModelsScreen(
                                     file = file,
                                     isLoaded = isLoaded,
                                     isLoading = isLoading,
+                                    npuCapabilities = npuCapabilities,
+                                    npuCompatibilityReport = if (isLoaded) npuCompatibilityReport else null,
                                     onLoad = { onLoadLocalModel(file) },
                                     onUnload = onUnloadLocalModel,
                                     onOpenChat = onOpenChatWithModel,
@@ -1023,6 +1029,8 @@ private fun LocalWeightCard(
     file: LocalWeightFile,
     isLoaded: Boolean,
     isLoading: Boolean,
+    npuCapabilities: NpuProbeResult?,
+    npuCompatibilityReport: NpuCompatibilityReport?,
     onLoad: () -> Unit,
     onUnload: () -> Unit,
     onOpenChat: () -> Unit,
@@ -1098,6 +1106,25 @@ private fun LocalWeightCard(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                        val compatText = when {
+                            npuCompatibilityReport != null ->
+                                "NPU Gate: ${npuCompatibilityReport.verdictCode.label} → ${npuCompatibilityReport.routedFallbackTarget}"
+                            file.diskFileName.endsWith(".gguf", ignoreCase = true) && npuCapabilities?.isHardwareLikelyPresent == true ->
+                                "NPU Gate (${npuCapabilities.vendorFamily.label}): GGUF runs on Vulkan GPU / CPU"
+                            else -> null
+                        }
+                        if (compatText != null) {
+                            Text(
+                                text = compatText,
+                                style = QuantTextStyles.LabelSm,
+                                color = QuantOutline,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .padding(top = 2.dp)
+                                    .testTag("local_weight_npu_gate_${file.diskFileName}")
                             )
                         }
                     }

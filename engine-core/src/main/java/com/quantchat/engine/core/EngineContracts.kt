@@ -64,6 +64,78 @@ data class VulkanProbeResult(
             operatorSelfTestPassed
 }
 
+enum class NpuVendorFamily(val label: String, val stackName: String) {
+    QUALCOMM_HEXAGON("Qualcomm Hexagon NPU", "Qualcomm AI Engine Direct (QNN HTP)"),
+    MEDIATEK_APU("MediaTek APU", "MediaTek NeuroPilot"),
+    GOOGLE_TENSOR_TPU("Google Tensor TPU", "Tensor NNAPI / LiteRT Delegate"),
+    SAMSUNG_EXYNOS_NPU("Samsung Exynos NPU", "Exynos NPU / ENN SDK"),
+    GENERIC_NNAPI("Android NNAPI", "Android NNAPI Runtime"),
+    NONE("No Dedicated NPU", "CPU / GPU Runtime Only")
+}
+
+enum class NpuProbeStatus(val label: String) {
+    RUNTIME_READY("NPU Runtime Accessible"),
+    HARDWARE_DETECTED_RUNTIME_UNBUNDLED("NPU Detected · Runtime Unbundled"),
+    NNAPI_ONLY_LEGACY("NNAPI Only (Legacy)"),
+    UNSUPPORTED_DEVICE("No Dedicated NPU Detected"),
+    PROBE_FAILED("Probe Failed")
+}
+
+enum class ModelArtifactFormat(val label: String) {
+    GGUF("GGUF (llama.cpp)"),
+    QNN_CONTEXT_BIN("QNN Context Binary (.bin)"),
+    QNN_DLC("Qualcomm DLC (.dlc)"),
+    TFLITE_DELEGATE("TFLite / LiteRT (.tflite)"),
+    UNKNOWN("Unknown Artifact")
+}
+
+data class NpuNativeRuntimeProbe(
+    val nativeProbeExecuted: Boolean = false,
+    val qnnHtpAccessible: Boolean = false,
+    val cdspRpcAccessible: Boolean = false,
+    val qnnError: String? = null,
+    val cdspError: String? = null
+)
+
+data class NpuProbeResult(
+    val status: NpuProbeStatus,
+    val vendorFamily: NpuVendorFamily,
+    val chipsetLabel: String,
+    val socManufacturer: String = "",
+    val hexagonGenerationHint: String? = null,
+    val supportsNnapi: Boolean = false,
+    val nnapiDeprecatedOnOs: Boolean = false,
+    val qnnRuntimePresent: Boolean = false,
+    val cdspRpcAccessible: Boolean = false,
+    val supportedPrecisionHints: List<String> = emptyList(),
+    val summary: String,
+    val reason: String? = null,
+    val probedAtMs: Long = System.currentTimeMillis()
+) {
+    val isHardwareLikelyPresent: Boolean
+        get() = vendorFamily != NpuVendorFamily.NONE
+
+    val isVendorRuntimeReady: Boolean
+        get() = status == NpuProbeStatus.RUNTIME_READY && qnnRuntimePresent
+}
+
+enum class NpuCompatibilityVerdict(val label: String) {
+    COMPATIBLE("NPU Compatible"),
+    INCOMPATIBLE_FORMAT("GGUF Gated · CPU/Vulkan"),
+    RUNTIME_UNAVAILABLE("NPU Runtime Unbundled"),
+    UNSUPPORTED_DEVICE("NPU Not Available")
+}
+
+data class NpuCompatibilityReport(
+    val modelId: String,
+    val artifactFormat: ModelArtifactFormat,
+    val compatibleWithNpu: Boolean,
+    val verdictCode: NpuCompatibilityVerdict,
+    val operatorRequirementsSummary: String,
+    val blockingReason: String?,
+    val routedFallbackTarget: String
+)
+
 data class BackendRuntimeStatus(
     val activeBackend: AcceleratorBackendType = AcceleratorBackendType.CPU,
     val requestedPreference: AcceleratorPreference = AcceleratorPreference.AUTO,
@@ -170,6 +242,12 @@ sealed class EngineError(
     ) : EngineError(reason, cause)
 
     class GpuBackendError(
+        val reason: String,
+        val fallbackEligible: Boolean = true,
+        cause: Throwable? = null
+    ) : EngineError(reason, cause)
+
+    class NpuBackendError(
         val reason: String,
         val fallbackEligible: Boolean = true,
         cause: Throwable? = null

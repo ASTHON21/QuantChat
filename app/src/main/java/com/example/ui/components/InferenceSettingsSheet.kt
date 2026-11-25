@@ -87,6 +87,7 @@ fun InferenceSettingsSheet(
     onCalibrateThreads: () -> Unit = {},
     onCancelCalibration: () -> Unit = {},
     onRunVulkanSelfTest: () -> Unit = {},
+    onRunNpuProbe: () -> Unit = {},
     onDismiss: () -> Unit,
     onApply: (InferenceSettings) -> Unit,
     onOpenVersionInfo: () -> Unit = {}
@@ -154,7 +155,8 @@ fun InferenceSettingsSheet(
                     onRunBenchmark = onRunBenchmark,
                     onCalibrateThreads = onCalibrateThreads,
                     onCancelCalibration = onCancelCalibration,
-                    onRunVulkanSelfTest = onRunVulkanSelfTest
+                    onRunVulkanSelfTest = onRunVulkanSelfTest,
+                    onRunNpuProbe = onRunNpuProbe
                 )
             }
 
@@ -460,7 +462,8 @@ private fun HardwareCapabilitiesCard(
     onRunBenchmark: () -> Unit,
     onCalibrateThreads: () -> Unit,
     onCancelCalibration: () -> Unit,
-    onRunVulkanSelfTest: () -> Unit
+    onRunVulkanSelfTest: () -> Unit,
+    onRunNpuProbe: () -> Unit
 ) {
     val profile = snapshot.hardwareProfile
     val metrics = snapshot.liveMetrics ?: profile?.liveMetrics
@@ -664,6 +667,12 @@ private fun HardwareCapabilitiesCard(
                 color = QuantOutline
             )
         }
+
+        NpuDiagnosticsSection(
+            npuCapabilities = snapshot.npuCapabilities ?: profile?.npuCapabilities,
+            compatibilityReport = snapshot.npuCompatibilityReport,
+            onRunNpuProbe = onRunNpuProbe
+        )
 
         HorizontalDivider(color = QuantSurfaceHigh, thickness = 0.8.dp)
 

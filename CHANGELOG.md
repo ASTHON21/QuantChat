@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.5.0 (Build 6) - 2026-11-25
+
+### Phase 1.3: NPU / Hexagon Capability Detection & GGUF Compatibility Gate
+- **Multi-Vendor NPU Probing (`hardware-manager`)**: Added `NpuCapabilityProbe` inspecting SoC manufacturer/model, chipset prefixes, OS NNAPI availability/deprecation (API 35+), and optional non-root JNI `dlopen` checks (`libQnnHtp.so` / `libcdsprpc.so`) for Qualcomm Snapdragon Hexagon HTP, MediaTek APU, Google Tensor TPU, Samsung Exynos NPU, and Android NNAPI.
+- **Vendor-Agnostic NPU Backend Contract (`engine-core`)**: Added `NpuInferenceBackend`, `NpuVendorDriverAdapter`, `NpuProbeResult`, `ModelArtifactFormat`, `NpuCompatibilityReport`, and `EngineError.NpuBackendError` cleanly wired into `ResilientFailoverBackend`.
+- **Automatic GGUF Compatibility Gate (`resource-manager` / `app`)**: Added `NpuCompatibilityEvaluator`, `"Run NPU Probe"` live diagnostics panel (`NpuDiagnosticsSection`) in Inference Settings, and local GGUF NPU compatibility gate badges in Models Screen explaining why `.gguf` files route via `Vulkan GPU → CPU`.
+
 ## v1.4.0 (Build 5) - 2026-11-25
 
 ### Phase 1.2: Native Vulkan GPU Acceleration & Safe CPU Failover

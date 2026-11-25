@@ -1,5 +1,6 @@
 package com.quantchat.engine.vulkan
 
+import com.quantchat.engine.core.NpuNativeRuntimeProbe
 import com.quantchat.engine.core.VulkanProbeResult
 import com.quantchat.engine.core.VulkanProbeStatus
 
@@ -63,6 +64,44 @@ object VulkanNativeBridge {
         }
     }
 
+    fun probeNpuRuntime(): NpuNativeRuntimeProbe {
+        if (!isLibraryAvailable()) {
+            return NpuNativeRuntimeProbe(
+                nativeProbeExecuted = false,
+                qnnHtpAccessible = false,
+                cdspRpcAccessible = false,
+                qnnError = loadError ?: "Native bridge not bundled",
+                cdspError = loadError ?: "Native bridge not bundled"
+            )
+        }
+        return runCatching {
+            parseNpuProbeResponse(nativeProbeNpuRuntime())
+        }.getOrElse { err ->
+            val msg = err.message ?: err::class.simpleName ?: "JNI probe exception"
+            NpuNativeRuntimeProbe(
+                nativeProbeExecuted = false,
+                qnnError = msg,
+                cdspError = msg
+            )
+        }
+    }
+
+    fun parseNpuProbeResponse(raw: String): NpuNativeRuntimeProbe {
+        val map = raw.lineSequence()
+            .mapNotNull { line ->
+                val idx = line.indexOf('=')
+                if (idx <= 0) null else line.substring(0, idx).trim() to line.substring(idx + 1).trim()
+            }
+            .toMap()
+        return NpuNativeRuntimeProbe(
+            nativeProbeExecuted = true,
+            qnnHtpAccessible = map["qnnHtpAccessible"] == "true",
+            cdspRpcAccessible = map["cdspRpcAccessible"] == "true",
+            qnnError = map["qnnError"]?.takeIf { it.isNotBlank() },
+            cdspError = map["cdspError"]?.takeIf { it.isNotBlank() }
+        )
+    }
+
     fun parseProbeResponse(raw: String): VulkanProbeResult {
         val map = raw.lineSequence()
             .mapNotNull { line ->
@@ -103,6 +142,9 @@ object VulkanNativeBridge {
 
     @JvmStatic
     external fun nativeProbeVulkan(): String
+
+    @JvmStatic
+    external fun nativeProbeNpuRuntime(): String
 
     @JvmStatic
     external fun nativeLoadModelFd(

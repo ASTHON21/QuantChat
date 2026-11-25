@@ -472,6 +472,30 @@ Java_com_quantchat_engine_vulkan_VulkanNativeBridge_nativeProbeVulkan(JNIEnv* en
     return env->NewStringUTF(ss.str().c_str());
 }
 
+JNIEXPORT jstring JNICALL
+Java_com_quantchat_engine_vulkan_VulkanNativeBridge_nativeProbeNpuRuntime(JNIEnv* env, jclass) {
+    auto try_dlopen = [](const char* lib_name) -> std::pair<bool, std::string> {
+        dlerror();
+        void* handle = dlopen(lib_name, RTLD_LAZY | RTLD_LOCAL);
+        if (handle != nullptr) {
+            dlclose(handle);
+            return {true, ""};
+        }
+        const char* err = dlerror();
+        return {false, err != nullptr ? std::string(err) : std::string("dlopen failed")};
+    };
+
+    auto qnn = try_dlopen("libQnnHtp.so");
+    auto cdsp = try_dlopen("libcdsprpc.so");
+
+    std::ostringstream ss;
+    ss << "qnnHtpAccessible=" << (qnn.first ? "true" : "false") << "\n"
+       << "cdspRpcAccessible=" << (cdsp.first ? "true" : "false") << "\n"
+       << "qnnError=" << sanitize_kv(qnn.second) << "\n"
+       << "cdspError=" << sanitize_kv(cdsp.second) << "\n";
+    return env->NewStringUTF(ss.str().c_str());
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_quantchat_engine_vulkan_VulkanNativeBridge_nativeLoadModelFd(
     JNIEnv* env,
