@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.PowerManager
+import com.quantchat.engine.core.DeviceCapabilities
 import com.quantchat.engine.core.EngineCapabilities
+import com.quantchat.engine.core.HardwareCapabilityProvider
 import com.quantchat.engine.core.NpuNativeRuntimeProbe
 import com.quantchat.engine.core.NpuProbeResult
 import com.quantchat.engine.core.VulkanProbeResult
@@ -18,13 +20,13 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
-enum class ThermalSeverity(val label: String) {
-    NOMINAL("Nominal"),
-    LIGHT("Light"),
-    MODERATE("Moderate"),
-    SEVERE("Severe"),
-    CRITICAL("Critical"),
-    UNAVAILABLE("Unknown")
+enum class ThermalSeverity(val label: String, val statusCode: Int) {
+    NOMINAL("Nominal", DeviceCapabilities.THERMAL_STATUS_NOMINAL),
+    LIGHT("Light", DeviceCapabilities.THERMAL_STATUS_LIGHT),
+    MODERATE("Moderate", DeviceCapabilities.THERMAL_STATUS_MODERATE),
+    SEVERE("Severe", DeviceCapabilities.THERMAL_STATUS_SEVERE),
+    CRITICAL("Critical", DeviceCapabilities.THERMAL_STATUS_CRITICAL),
+    UNAVAILABLE("Unknown", DeviceCapabilities.THERMAL_STATUS_UNKNOWN)
 }
 
 data class CpuClusterSummary(
@@ -53,7 +55,8 @@ data class LiveDeviceMetrics(
     val totalRamMb: Long,
     val availableRamMb: Long,
     val lowMemory: Boolean,
-    val thermalSeverity: ThermalSeverity
+    val thermalSeverity: ThermalSeverity,
+    val availableMemoryBytes: Long = availableRamMb * 1024L * 1024L
 )
 
 data class DeviceHardwareProfile(
@@ -81,22 +84,49 @@ class HardwareCapabilityManager(
     private val context: Context,
     private val vulkanNativeProbe: (suspend () -> VulkanProbeResult)? = null,
     private val npuNativeProbe: (suspend () -> NpuNativeRuntimeProbe)? = null
-) {
+) : HardwareCapabilityProvider {
+
+    private val capabilityLock = Any()
+
+    @Volatile
+    private var cachedCpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+
+    @Volatile
+    private var cachedCpuFeatures: Set<String> = readCpuFeatures()
+
+    @Volatile
+    private var cachedGpuBackends: Set<String> = emptySet()
+
+    @Volatile
+    private var cachedNpuAvailable: Boolean = false
 
     private val _thermalSeverityFlow = MutableStateFlow(readCurrentThermalStatus())
     val thermalSeverityFlow: StateFlow<ThermalSeverity> = _thermalSeverityFlow.asStateFlow()
 
+    private val _deviceCapabilities = MutableStateFlow(buildDeviceCapabilities(readMemoryAndThermalRaw()))
+    override val deviceCapabilities: StateFlow<DeviceCapabilities> = _deviceCapabilities.asStateFlow()
+
     private val thermalListenerLock = Any()
     private var registeredThermalListener: Any? = null
 
+    override fun getDeviceCapabilities(): DeviceCapabilities {
+        val metrics = readMemoryAndThermalRaw()
+        _thermalSeverityFlow.value = metrics.thermalSeverity
+        return publishDeviceCapabilities(metrics)
+    }
+
     fun startThermalMonitoring() {
-        _thermalSeverityFlow.value = readCurrentThermalStatus()
+        val initialThermal = readCurrentThermalStatus()
+        _thermalSeverityFlow.value = initialThermal
+        publishDeviceCapabilities(readMemoryAndThermalRaw(overrideThermal = initialThermal))
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
         synchronized(thermalListenerLock) {
             if (registeredThermalListener != null) return
             val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
             val listener = PowerManager.OnThermalStatusChangedListener { status ->
-                _thermalSeverityFlow.value = mapPowerThermalStatus(status)
+                val mapped = mapPowerThermalStatus(status)
+                _thermalSeverityFlow.value = mapped
+                publishDeviceCapabilities(readMemoryAndThermalRaw(overrideThermal = mapped))
             }
             val registered = runCatching {
                 pm.addThermalStatusListener(context.mainExecutor, listener)
@@ -126,11 +156,25 @@ class HardwareCapabilityManager(
     }
 
     suspend fun probeVulkanCapabilities(): VulkanProbeResult = withContext(Dispatchers.IO) {
-        VulkanCapabilityProbe.probe(context, vulkanNativeProbe)
+        val result = VulkanCapabilityProbe.probe(context, vulkanNativeProbe)
+        synchronized(capabilityLock) {
+            cachedGpuBackends = if (result.isUsableForInference) {
+                setOf(DeviceCapabilities.GPU_BACKEND_VULKAN)
+            } else {
+                emptySet()
+            }
+        }
+        publishDeviceCapabilities(readMemoryAndThermalRaw())
+        result
     }
 
     suspend fun probeNpuCapabilities(): NpuProbeResult = withContext(Dispatchers.IO) {
-        NpuCapabilityProbe.probe(context, npuNativeProbe)
+        val result = NpuCapabilityProbe.probe(context, npuNativeProbe)
+        synchronized(capabilityLock) {
+            cachedNpuAvailable = result.isVendorRuntimeReady
+        }
+        publishDeviceCapabilities(readMemoryAndThermalRaw())
+        result
     }
 
     suspend fun probeHardware(engineCapabilities: EngineCapabilities): DeviceHardwareProfile =
@@ -151,6 +195,21 @@ class HardwareCapabilityManager(
                 context.packageManager.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
             val hasNnapi = npuProbe.supportsNnapi || Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1
             val metrics = currentMemoryAndThermalSnapshot()
+
+            val gpuSet = if (vulkanProbe.isUsableForInference) {
+                setOf(DeviceCapabilities.GPU_BACKEND_VULKAN)
+            } else {
+                emptySet()
+            }
+            val npuReady = npuProbe.isVendorRuntimeReady && engineCapabilities.supportsNpuOffload
+
+            synchronized(capabilityLock) {
+                cachedCpuCores = clusters.onlineCores.coerceAtLeast(1)
+                cachedCpuFeatures = cpuFlags
+                cachedGpuBackends = gpuSet
+                cachedNpuAvailable = npuProbe.isVendorRuntimeReady
+            }
+            publishDeviceCapabilities(metrics)
 
             val gpuSummary = when {
                 vulkanProbe.isUsableForInference ->
@@ -173,7 +232,7 @@ class HardwareCapabilityManager(
                 hasSystemVulkan = hasVulkan,
                 hasSystemNnapi = hasNnapi,
                 activeBackendGpuSupported = vulkanProbe.isUsableForInference || engineCapabilities.supportsGpuOffload,
-                activeBackendNpuSupported = npuProbe.isVendorRuntimeReady && engineCapabilities.supportsNpuOffload,
+                activeBackendNpuSupported = npuReady,
                 gpuStatusSummary = gpuSummary,
                 liveMetrics = metrics,
                 vulkanCapabilities = vulkanProbe,
@@ -182,23 +241,47 @@ class HardwareCapabilityManager(
         }
 
     fun currentMemoryAndThermalSnapshot(): LiveDeviceMetrics {
+        val metrics = readMemoryAndThermalRaw()
+        _thermalSeverityFlow.value = metrics.thermalSeverity
+        publishDeviceCapabilities(metrics)
+        return metrics
+    }
+
+    private fun readMemoryAndThermalRaw(overrideThermal: ThermalSeverity? = null): LiveDeviceMetrics {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
         val memInfo = ActivityManager.MemoryInfo()
         if (am != null) {
             am.getMemoryInfo(memInfo)
         }
         val totalMb = (memInfo.totalMem / (1024L * 1024L)).coerceAtLeast(0L)
-        val availMb = (memInfo.availMem / (1024L * 1024L)).coerceAtLeast(0L)
-
-        val thermal = readCurrentThermalStatus()
-        _thermalSeverityFlow.value = thermal
+        val availBytes = memInfo.availMem.coerceAtLeast(0L)
+        val availMb = (availBytes / (1024L * 1024L)).coerceAtLeast(0L)
+        val thermal = overrideThermal ?: readCurrentThermalStatus()
 
         return LiveDeviceMetrics(
             totalRamMb = totalMb,
             availableRamMb = availMb,
             lowMemory = memInfo.lowMemory,
-            thermalSeverity = thermal
+            thermalSeverity = thermal,
+            availableMemoryBytes = availBytes
         )
+    }
+
+    private fun buildDeviceCapabilities(metrics: LiveDeviceMetrics): DeviceCapabilities = synchronized(capabilityLock) {
+        DeviceCapabilities(
+            cpuCores = cachedCpuCores.coerceAtLeast(1),
+            cpuFeatures = cachedCpuFeatures,
+            gpuBackends = cachedGpuBackends,
+            npuAvailable = cachedNpuAvailable,
+            availableMemoryBytes = metrics.availableMemoryBytes,
+            thermalStatus = metrics.thermalSeverity.statusCode
+        )
+    }
+
+    private fun publishDeviceCapabilities(metrics: LiveDeviceMetrics): DeviceCapabilities {
+        val snapshot = buildDeviceCapabilities(metrics)
+        _deviceCapabilities.value = snapshot
+        return snapshot
     }
 
     private fun readCurrentThermalStatus(): ThermalSeverity {

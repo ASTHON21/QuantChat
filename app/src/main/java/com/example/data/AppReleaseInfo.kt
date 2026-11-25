@@ -19,10 +19,22 @@ object AppReleaseInfo {
 
     val changelog: List<ReleaseChangelogEntry> = listOf(
         ReleaseChangelogEntry(
+            version = "v1.6.0",
+            buildNumber = 7,
+            date = "2026-11-25",
+            badge = "CURRENT",
+            highlights = listOf(
+                "Phase 1.4: Added canonical DeviceCapabilities schema and HardwareCapabilityProvider contract in :engine-core with both reactive StateFlow updates and synchronous getDeviceCapabilities() snapshots.",
+                "Upgraded HardwareCapabilityManager to maintain and emit live unified CPU, SIMD, GPU, NPU, memory, and integer thermal status snapshots across probes and PowerManager thermal callbacks.",
+                "Integrated DeviceCapabilitiesPolicy directly into ResilientFailoverBackend for automatic GPU eligibility gating (low-memory & severe-thermal CPU fallback) and per-request thermal thread downshifting.",
+                "Added Unified Device Capabilities card in Inference Settings displaying the live 6-field snapshot linked directly to engine routing and thermal guard status."
+            )
+        ),
+        ReleaseChangelogEntry(
             version = "v1.5.0",
             buildNumber = 6,
             date = "2026-11-25",
-            badge = "CURRENT",
+            badge = "RELEASED",
             highlights = listOf(
                 "Phase 1.3: Added non-root Android NPU hardware detection (NpuCapabilityProbe) prioritizing Qualcomm Snapdragon Hexagon HTP (SM8xxx/SM7xxx generation hints) alongside MediaTek APU, Google Tensor TPU, Samsung Exynos NPU, and Android NNAPI.",
                 "Added vendor-agnostic NpuInferenceBackend & NpuVendorDriverAdapter abstraction in :engine-core with typed EngineError.NpuBackendError rejection for unbundled SDKs or incompatible artifacts.",

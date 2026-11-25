@@ -18,10 +18,13 @@ class ResilientFailoverBackend(
             reason = "No Vulkan backend configured."
         )
     },
-    private val npuBackend: NpuInferenceBackend? = null
+    private val npuBackend: NpuInferenceBackend? = null,
+    private val capabilityProvider: HardwareCapabilityProvider? = null
 ) : InferenceBackend {
 
     fun npuInferenceBackend(): NpuInferenceBackend? = npuBackend
+
+    fun currentDeviceCapabilities(): DeviceCapabilities? = capabilityProvider?.getDeviceCapabilities()
 
     private val routeMutex = Mutex()
 
@@ -188,6 +191,23 @@ class ResilientFailoverBackend(
                 )
             }
 
+            val capSnapshot = capabilityProvider?.getDeviceCapabilities()
+            if (capSnapshot != null) {
+                val gate = DeviceCapabilitiesPolicy.evaluateGpuEligibility(capSnapshot, pref)
+                if (!gate.gpuEligible) {
+                    runCatching { gpuBackend.unload() }
+                    return@withLock loadCpuOnlyLocked(
+                        model = model.copy(gpuLayers = 0),
+                        requestedPreference = pref,
+                        requestedGpuLayers = model.gpuLayers,
+                        totalLayers = totalLayers,
+                        fallbackOccurred = true,
+                        fallbackReason = gate.reason ?: "Blocked by DeviceCapabilities policy.",
+                        statusSummary = if (capSnapshot.isSevereThermal) "CPU Thermal Guard" else "CPU Policy Fallback"
+                    )
+                }
+            }
+
             // Unload CPU context before mapping tensors via Vulkan GPU
             runCatching { fallbackCpuBackend.unload() }
 
@@ -263,11 +283,26 @@ class ResilientFailoverBackend(
 
     override fun generate(request: GenerationRequest): Flow<GenerationEvent> = channelFlow {
         val initialBackend = activeBackend
+        val capSnapshot = capabilityProvider?.getDeviceCapabilities()
+        val effectiveRequest = if (capSnapshot != null) {
+            DeviceCapabilitiesPolicy.applyThermalDownshift(request, capSnapshot)
+        } else {
+            request
+        }
+        if (capSnapshot?.isThermallyThrottled == true) {
+            val currentStatus = _runtimeStatus.value
+            val suffix = " · Thermal Guard (${effectiveRequest.threadsOverride ?: capSnapshot.cpuCores}T)"
+            if (!currentStatus.statusSummary.contains("Thermal Guard")) {
+                _runtimeStatus.value = currentStatus.copy(
+                    statusSummary = currentStatus.statusSummary + suffix
+                )
+            }
+        }
         var emittedAnyToken = false
         var generationSucceeded = false
 
         try {
-            initialBackend.generate(request).collect { event ->
+            initialBackend.generate(effectiveRequest).collect { event ->
                 if (event is GenerationEvent.TokenDelta) {
                     emittedAnyToken = true
                 }
@@ -305,7 +340,7 @@ class ResilientFailoverBackend(
                     )
                 }
                 _lifecycleState.value = failoverReady
-                fallbackCpuBackend.generate(request).collect { event ->
+                fallbackCpuBackend.generate(effectiveRequest).collect { event ->
                     _lifecycleState.value = fallbackCpuBackend.lifecycleState.value
                     send(event)
                 }

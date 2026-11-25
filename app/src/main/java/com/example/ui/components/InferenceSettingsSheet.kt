@@ -150,8 +150,10 @@ fun InferenceSettingsSheet(
             if (orchestratorSnapshot != null) {
                 HardwareCapabilitiesCard(
                     snapshot = orchestratorSnapshot,
+                    acceleratorPreference = acceleratorPreference,
                     savedCalibratedThreads = currentSettings.calibratedOptimalThreads,
                     isModelReady = isModelReady,
+                    onRefreshCapabilities = onRefreshDiagnostics,
                     onRunBenchmark = onRunBenchmark,
                     onCalibrateThreads = onCalibrateThreads,
                     onCancelCalibration = onCancelCalibration,
@@ -457,8 +459,10 @@ fun InferenceSettingsSheet(
 @Composable
 private fun HardwareCapabilitiesCard(
     snapshot: OrchestratorSnapshot,
+    acceleratorPreference: AcceleratorPreference,
     savedCalibratedThreads: Int?,
     isModelReady: Boolean,
+    onRefreshCapabilities: () -> Unit,
     onRunBenchmark: () -> Unit,
     onCalibrateThreads: () -> Unit,
     onCancelCalibration: () -> Unit,
@@ -590,6 +594,13 @@ private fun HardwareCapabilitiesCard(
                 value = "${savedCalibratedThreads}T saved on this device"
             )
         }
+
+        UnifiedCapabilitiesCard(
+            deviceCapabilities = snapshot.deviceCapabilities,
+            backendStatus = snapshot.backendRuntimeStatus,
+            acceleratorPreference = acceleratorPreference,
+            onRefreshCapabilities = onRefreshCapabilities
+        )
 
         // Vulkan GPU & OpenCL Phase 2 Diagnostics Section
         val vk = snapshot.vulkanCapabilities ?: profile?.vulkanCapabilities

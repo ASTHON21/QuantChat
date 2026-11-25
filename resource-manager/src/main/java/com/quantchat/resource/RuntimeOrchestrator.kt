@@ -5,6 +5,7 @@ import com.quantchat.engine.core.BackendRuntimeStatus
 import com.quantchat.engine.core.BenchmarkResult
 import com.quantchat.engine.core.ChatTurn
 import com.quantchat.engine.core.CpuScheduleMode
+import com.quantchat.engine.core.DeviceCapabilities
 import com.quantchat.engine.core.EngineCapabilities
 import com.quantchat.engine.core.EngineConfig
 import com.quantchat.engine.core.EngineError
@@ -71,7 +72,8 @@ data class OrchestratorSnapshot(
     val autoGpuLayerOffload: Boolean = true,
     val manualGpuLayers: Int = 0,
     val npuCapabilities: NpuProbeResult? = null,
-    val npuCompatibilityReport: NpuCompatibilityReport? = null
+    val npuCompatibilityReport: NpuCompatibilityReport? = null,
+    val deviceCapabilities: DeviceCapabilities? = null
 )
 
 data class ModelLoadOutcome(
@@ -97,7 +99,8 @@ class RuntimeOrchestrator(
             fallbackCpuBackend = primaryBackend,
             primaryGpuBackend = vulkanBackend,
             probeProvider = vulkanProbeProvider ?: { hardwareManager.probeVulkanCapabilities() },
-            npuBackend = npuBackend
+            npuBackend = npuBackend,
+            capabilityProvider = hardwareManager
         )
     }
 
@@ -131,7 +134,8 @@ class RuntimeOrchestrator(
             lifecycleState = resilientBackend.lifecycleState.value,
             versionInfo = resilientBackend.versionInfo,
             capabilities = resilientBackend.capabilities,
-            backendRuntimeStatus = resilientBackend.runtimeStatus.value
+            backendRuntimeStatus = resilientBackend.runtimeStatus.value,
+            deviceCapabilities = hardwareManager.deviceCapabilities.value
         )
     )
     val snapshot: StateFlow<OrchestratorSnapshot> = _snapshot.asStateFlow()
@@ -140,6 +144,13 @@ class RuntimeOrchestrator(
         orchestratorScope.launch {
             hardwareManager.thermalSeverityFlow.collect { severity ->
                 updateThermalInSnapshot(severity)
+            }
+        }
+        orchestratorScope.launch {
+            hardwareManager.deviceCapabilities.collect { caps ->
+                _snapshot.update { current ->
+                    current.copy(deviceCapabilities = caps)
+                }
             }
         }
         orchestratorScope.launch {
@@ -240,7 +251,8 @@ class RuntimeOrchestrator(
                 autoGpuLayerOffload = autoGpuLayerOffload,
                 manualGpuLayers = manualGpuLayers,
                 npuCapabilities = npuProbe,
-                npuCompatibilityReport = compatReport
+                npuCompatibilityReport = compatReport,
+                deviceCapabilities = hardwareManager.getDeviceCapabilities()
             )
         }
         return profile
@@ -326,7 +338,8 @@ class RuntimeOrchestrator(
                     vulkanCapabilities = finalProbe,
                     gpuOffloadPlan = offloadPlan,
                     npuCapabilities = npuProbe,
-                    npuCompatibilityReport = compatReport
+                    npuCompatibilityReport = compatReport,
+                    deviceCapabilities = hardwareManager.getDeviceCapabilities()
                 )
             }
         }
@@ -476,7 +489,8 @@ class RuntimeOrchestrator(
                     liveMetrics = metrics,
                     backendRuntimeStatus = resilientBackend.runtimeStatus.value,
                     gpuOffloadPlan = computeOffloadPlanLocked(metrics, probe),
-                    npuCompatibilityReport = null
+                    npuCompatibilityReport = null,
+                    deviceCapabilities = hardwareManager.getDeviceCapabilities()
                 )
             }
         }
@@ -721,7 +735,8 @@ class RuntimeOrchestrator(
                     autoGpuLayerOffload = autoGpuLayerOffload,
                     manualGpuLayers = manualGpuLayers,
                     npuCapabilities = npuProbe,
-                    npuCompatibilityReport = compatReport
+                    npuCompatibilityReport = compatReport,
+                    deviceCapabilities = hardwareManager.getDeviceCapabilities()
                 )
             } else {
                 val decision = computeDecisionLocked(profile, metrics.thermalSeverity, lastWorkload)
@@ -742,7 +757,8 @@ class RuntimeOrchestrator(
                     autoGpuLayerOffload = autoGpuLayerOffload,
                     manualGpuLayers = manualGpuLayers,
                     npuCapabilities = npuProbe,
-                    npuCompatibilityReport = compatReport
+                    npuCompatibilityReport = compatReport,
+                    deviceCapabilities = hardwareManager.getDeviceCapabilities()
                 )
             }
         }

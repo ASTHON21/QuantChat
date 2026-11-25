@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.6.0 (Build 7) - 2026-11-25
+
+### Phase 1.4: Unified Hardware Scheduling Interface (`DeviceCapabilities`)
+- **Unified Capability Contract (`engine-core`)**: Added canonical `DeviceCapabilities` data class (`cpuCores`, `cpuFeatures`, `gpuBackends`, `npuAvailable`, `availableMemoryBytes`, `thermalStatus`), `HardwareCapabilityProvider` (`deviceCapabilities: StateFlow<DeviceCapabilities>` + synchronous `getDeviceCapabilities()`), and `DeviceCapabilitiesPolicy`.
+- **Live Hardware Emission (`hardware-manager`)**: Upgraded `HardwareCapabilityManager` to implement `HardwareCapabilityProvider` and continuously emit unified `DeviceCapabilities` snapshots across hardware initialization, Vulkan/NPU probes, and `PowerManager` thermal transitions.
+- **Engine Policy & Thermal Downshift (`engine-core` / `resource-manager`)**: Wired `HardwareCapabilityProvider` directly into `ResilientFailoverBackend` so `loadModel()` and `generate()` enforce GPU eligibility, low-memory/severe-thermal CPU failover, and automatic thread downshifting (`THERMAL_STATUS_MODERATE+`) while syncing snapshots into `RuntimeOrchestrator`.
+- **Unified Diagnostics UI (`app`)**: Added `UnifiedCapabilitiesCard` inside Inference Settings showing the live 6-field `DeviceCapabilities` snapshot linked to scheduler routing and thermal guard status.
+
 ## v1.5.0 (Build 6) - 2026-11-25
 
 ### Phase 1.3: NPU / Hexagon Capability Detection & GGUF Compatibility Gate
