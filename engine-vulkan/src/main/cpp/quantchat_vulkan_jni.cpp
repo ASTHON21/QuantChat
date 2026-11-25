@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
 #include <memory>
@@ -43,6 +44,7 @@ struct VulkanContextHandle {
     llama_context* ctx = nullptr;
     const llama_vocab* vocab = nullptr;
     int32_t n_ctx = 2048;
+    int32_t n_batch = 512;
     int32_t n_threads = 4;
     int32_t n_gpu_layers = 0;
     std::atomic<bool> stop_requested{false};
@@ -487,8 +489,10 @@ Java_com_quantchat_engine_vulkan_VulkanNativeBridge_nativeLoadModelFd(
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = std::max(0, static_cast<int>(n_gpu_layers));
-    mparams.use_mmap = (use_mmap == JNI_TRUE);
-    mparams.use_mlock = (use_mlock == JNI_TRUE);
+    mparams.load_mode = (use_mmap == JNI_TRUE && use_mlock == JNI_TRUE) ? LLAMA_LOAD_MODE_MMAP_MLOCK
+        : (use_mmap == JNI_TRUE) ? LLAMA_LOAD_MODE_MMAP
+        : (use_mlock == JNI_TRUE) ? LLAMA_LOAD_MODE_MLOCK
+        : LLAMA_LOAD_MODE_NONE;
 
     llama_model* model = llama_model_load_from_file(fd_path.c_str(), mparams);
     if (model == nullptr) {
@@ -514,6 +518,7 @@ Java_com_quantchat_engine_vulkan_VulkanNativeBridge_nativeLoadModelFd(
     handle->ctx = ctx;
     handle->vocab = llama_model_get_vocab(model);
     handle->n_ctx = static_cast<int32_t>(cparams.n_ctx);
+    handle->n_batch = static_cast<int32_t>(cparams.n_batch);
     handle->n_threads = static_cast<int32_t>(cparams.n_threads);
     handle->n_gpu_layers = static_cast<int32_t>(mparams.n_gpu_layers);
 
@@ -715,21 +720,50 @@ Java_com_quantchat_engine_vulkan_VulkanNativeBridge_nativeLaunchCompletion(
         return -3;
     }
 
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
-    if (llama_decode(handle->ctx, batch) != 0) {
-        LOGE("Vulkan llama_decode failed during prompt prefill");
+    llama_batch_ext* batch = llama_batch_ext_init(handle->ctx);
+    if (batch == nullptr) {
+        LOGE("Vulkan llama_batch_ext_init failed");
         return -4;
+    }
+
+    int32_t n_past = 0;
+    const int32_t chunk_cap = std::max<int32_t>(64, handle->n_batch);
+    for (int32_t offset = 0; offset < n_prompt; offset += chunk_cap) {
+        const int32_t chunk_len = std::min(chunk_cap, n_prompt - offset);
+        llama_batch_ext_clear(batch);
+        int32_t last_idx = -1;
+        for (int32_t i = 0; i < chunk_len; ++i) {
+            const int32_t idx = llama_batch_ext_add_token(batch, 0, prompt_tokens[offset + i]);
+            if (idx < 0) {
+                llama_batch_ext_free(batch);
+                return -4;
+            }
+            const llama_pos pos = n_past + i;
+            llama_batch_ext_set_pos(batch, idx, &pos);
+            last_idx = idx;
+        }
+        if ((offset + chunk_len) >= n_prompt && last_idx >= 0) {
+            llama_batch_ext_set_output_logits(batch, last_idx, true);
+        }
+        if (llama_process(handle->ctx, LLAMA_PROCESS_TYPE_DECODE, batch) != 0) {
+            LOGE("Vulkan llama_process failed during prompt prefill");
+            llama_batch_ext_free(batch);
+            return -4;
+        }
+        n_past += chunk_len;
     }
 
     auto sparams = llama_sampler_chain_default_params();
     llama_sampler* sampler = llama_sampler_chain_init(sparams);
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, repeat_penalty, 0.0f, 0.0f));
+    const int32_t n_vocab = llama_vocab_n_tokens(handle->vocab);
     if (temperature <= 0.01f) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(n_vocab, 64, repeat_penalty, 0.0f, 0.0f));
         llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
     } else {
         llama_sampler_chain_add(sampler, llama_sampler_init_top_k(std::max(1, top_k)));
         llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
         llama_sampler_chain_add(sampler, llama_sampler_init_min_p(min_p, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(n_vocab, 64, repeat_penalty, 0.0f, 0.0f));
         llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
     }
@@ -760,15 +794,26 @@ Java_com_quantchat_engine_vulkan_VulkanNativeBridge_nativeLaunchCompletion(
         }
         ++generated;
 
-        llama_batch next_batch = llama_batch_get_one(&next_tok, 1);
-        if (llama_decode(handle->ctx, next_batch) != 0) {
-            LOGE("Vulkan llama_decode failed at decode step %d", step);
+        llama_batch_ext_clear(batch);
+        const int32_t idx = llama_batch_ext_add_token(batch, 0, next_tok);
+        if (idx < 0) {
             llama_sampler_free(sampler);
+            llama_batch_ext_free(batch);
+            return -5;
+        }
+        const llama_pos pos = n_past++;
+        llama_batch_ext_set_pos(batch, idx, &pos);
+        llama_batch_ext_set_output_logits(batch, idx, true);
+        if (llama_process(handle->ctx, LLAMA_PROCESS_TYPE_DECODE, batch) != 0) {
+            LOGE("Vulkan llama_process failed at decode step %d", step);
+            llama_sampler_free(sampler);
+            llama_batch_ext_free(batch);
             return -5;
         }
     }
 
     llama_sampler_free(sampler);
+    llama_batch_ext_free(batch);
     return generated;
 }
 
