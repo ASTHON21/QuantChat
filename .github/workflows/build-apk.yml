@@ -83,7 +83,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build libvulkan-dev vulkan-tools
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ libvulkan-dev vulkan-tools spirv-headers glslang-tools
           # Install Android NDK + shaderc/glslc if needed
           SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
@@ -102,12 +102,45 @@ jobs:
             git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$LLAMA_DIR"
           fi
 
-          # Ensure glslc from Android NDK shaderc or system is on PATH
-          SHADERC_BIN_DIR="$(dirname "$(find "$NDK_DIR/shader-tools" -name glslc -type f 2>/dev/null | head -n 1 || true)")"
-          if [ -n "$SHADERC_BIN_DIR" ] && [ -d "$SHADERC_BIN_DIR" ]; then
-            export PATH="$SHADERC_BIN_DIR:$PATH"
+          # Install Khronos SPIRV-Headers & Vulkan-Headers (provides SPIRV-HeadersConfig.cmake + latest vulkan.hpp)
+          VULKAN_DEPS="/tmp/vulkan-deps"
+          rm -rf "$VULKAN_DEPS" /tmp/spirv-headers-build /tmp/vulkan-headers-build /tmp/vulkan-arm64
+          if [ ! -d /tmp/SPIRV-Headers ]; then
+            git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/SPIRV-Headers
           fi
-          which glslc
+          cmake -S /tmp/SPIRV-Headers -B /tmp/spirv-headers-build -G Ninja \
+            -DCMAKE_INSTALL_PREFIX="$VULKAN_DEPS" \
+            -DSPIRV_HEADERS_ENABLE_TESTS=OFF
+          cmake --install /tmp/spirv-headers-build
+
+          if [ ! -d /tmp/Vulkan-Headers ]; then
+            git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/Vulkan-Headers
+          fi
+          cmake -S /tmp/Vulkan-Headers -B /tmp/vulkan-headers-build -G Ninja \
+            -DCMAKE_INSTALL_PREFIX="$VULKAN_DEPS" \
+            -DVULKAN_HEADERS_ENABLE_TESTS=OFF
+          cmake --install /tmp/vulkan-headers-build
+
+          SPIRV_CFG_DIR="$(dirname "$(find "$VULKAN_DEPS" -name 'SPIRV-HeadersConfig.cmake' | head -n 1)")"
+          echo "Resolved SPIRV-HeadersConfig.cmake in: $SPIRV_CFG_DIR"
+
+          # Host toolchain for ggml-vulkan's vulkan-shaders-gen code generator
+          cat <<'EOF' > /tmp/host-toolchain.cmake
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_C_COMPILER /usr/bin/gcc)
+          set(CMAKE_CXX_COMPILER /usr/bin/g++)
+          EOF
+
+          # Locate glslc from Android NDK shader-tools
+          GLSLC_BIN="$(find "$NDK_DIR/shader-tools" -name glslc -type f 2>/dev/null | head -n 1 || true)"
+          if [ -z "$GLSLC_BIN" ]; then
+            GLSLC_BIN="$(command -v glslc)"
+          fi
+          export PATH="$(dirname "$GLSLC_BIN"):$PATH"
+          "$GLSLC_BIN" --version || true
+
+          NDK_VULKAN_LIB="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28/libvulkan.so"
+          test -f "$NDK_VULKAN_LIB"
 
           cmake -S engine-vulkan/src/main/cpp -B /tmp/vulkan-arm64 -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="${NDK_DIR}/build/cmake/android.toolchain.cmake" \
@@ -115,7 +148,14 @@ jobs:
             -DANDROID_PLATFORM=android-28 \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLAMA_CPP_DIR="$LLAMA_DIR"
+            -DLLAMA_CPP_DIR="$LLAMA_DIR" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+            -DCMAKE_PREFIX_PATH="$VULKAN_DEPS" \
+            -DSPIRV-Headers_DIR="$SPIRV_CFG_DIR" \
+            -DVulkan_INCLUDE_DIR="$VULKAN_DEPS/include" \
+            -DVulkan_LIBRARY="$NDK_VULKAN_LIB" \
+            -DVulkan_GLSLC_EXECUTABLE="$GLSLC_BIN" \
+            -DGGML_VULKAN_SHADERS_GEN_TOOLCHAIN=/tmp/host-toolchain.cmake
           cmake --build /tmp/vulkan-arm64 --target quantchat_vulkan -j"$(nproc)"
 
           mkdir -p engine-vulkan/src/main/jniLibs/arm64-v8a

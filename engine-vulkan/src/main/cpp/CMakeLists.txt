@@ -15,8 +15,10 @@ set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 
 set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
@@ -30,10 +32,7 @@ add_library(quantchat_vulkan SHARED
 target_include_directories(quantchat_vulkan PRIVATE
     "${LLAMA_CPP_DIR}/include"
     "${LLAMA_CPP_DIR}/ggml/include"
-)
-
-target_compile_definitions(quantchat_vulkan PRIVATE
-    VK_NO_PROTOTYPES=0
+    $<$<BOOL:${Vulkan_INCLUDE_DIRS}>:${Vulkan_INCLUDE_DIRS}>
 )
 
 find_library(ANDROID_LIB android)
