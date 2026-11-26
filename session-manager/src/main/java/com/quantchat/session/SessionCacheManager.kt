@@ -158,6 +158,31 @@ class SessionCacheManager(private val sessionsDir: File) {
         sessionsDir.listFiles()?.forEach { runCatching { it.delete() } }
     }
 
+    fun pruneOrphanedCaches(
+        validThreadIds: Set<String>?,
+        maxAgeMs: Long = 14L * 24L * 3600L * 1000L,
+        nowMs: Long = System.currentTimeMillis()
+    ): Int {
+        val files = sessionsDir.listFiles() ?: return 0
+        val validSafeIds = validThreadIds?.map { it.replace(Regex("[^A-Za-z0-9._-]"), "_") }?.toSet()
+        var deleted = 0
+        for (file in files) {
+            val baseName = when {
+                file.name.endsWith(".llama_session") -> file.name.removeSuffix(".llama_session")
+                file.name.endsWith(".meta") -> file.name.removeSuffix(".meta")
+                else -> file.name
+            }
+            val orphaned = validSafeIds != null && baseName !in validSafeIds
+            val expired = maxAgeMs > 0L && (nowMs - file.lastModified()) > maxAgeMs
+            if (orphaned || expired) {
+                if (runCatching { file.delete() }.getOrDefault(false)) {
+                    deleted++
+                }
+            }
+        }
+        return deleted
+    }
+
     private fun hasValidSnapshot(threadId: String, fingerprint: String): Boolean {
         val sessionFile = snapshotFile(threadId)
         val metaFile = metaFile(threadId)

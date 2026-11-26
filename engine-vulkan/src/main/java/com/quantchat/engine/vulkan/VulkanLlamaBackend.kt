@@ -17,6 +17,8 @@ import com.quantchat.engine.core.GenerationEvent
 import com.quantchat.engine.core.GenerationRequest
 import com.quantchat.engine.core.InferenceBackend
 import com.quantchat.engine.core.InferenceThreadPriority
+import com.quantchat.engine.core.MmapLeaseHandle
+import com.quantchat.engine.core.MmapLifecycleRegistry
 import com.quantchat.engine.core.ModelConfig
 import com.quantchat.engine.core.PromptTemplateFormatter
 import com.quantchat.engine.core.SessionId
@@ -95,6 +97,9 @@ class VulkanLlamaBackend : InferenceBackend {
     private var activeSessionId: SessionId? = null
 
     @Volatile
+    private var activeMmapLease: MmapLeaseHandle? = null
+
+    @Volatile
     private var stopRequested: Boolean = false
 
     override suspend fun initialize(config: EngineConfig) {
@@ -150,9 +155,35 @@ class VulkanLlamaBackend : InferenceBackend {
                     throw err
                 }
 
+                val validGguf = validateModelFile(model.fileUri)
+                if (!validGguf) {
+                    val err = EngineError.InvalidModelFormat(
+                        model.displayName,
+                        "Failed GGUF magic header verification."
+                    )
+                    _lifecycleState.value = EngineLifecycleState.Faulted(model.modelId, err)
+                    throw err
+                }
+
+                val effectiveMmap = model.useMmap && engineConfig.enableMmap
+                val lease = try {
+                    MmapLifecycleRegistry.acquireReadMapping(
+                        file = diskFile,
+                        modelId = model.modelId.value,
+                        backendId = versionInfo.backendId,
+                        useMmap = effectiveMmap
+                    )
+                } catch (e: EngineError) {
+                    _lifecycleState.value = EngineLifecycleState.Faulted(model.modelId, e)
+                    throw e
+                }
+
                 val pfd = try {
-                    ParcelFileDescriptor.open(diskFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                    ParcelFileDescriptor.open(diskFile, ParcelFileDescriptor.MODE_READ_ONLY).also {
+                        MmapLifecycleRegistry.attachPfd(lease, it)
+                    }
                 } catch (e: Exception) {
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     val err = EngineError.GpuBackendError(
                         "Unable to open read-only FD for ${model.displayName}",
                         fallbackEligible = true,
@@ -169,15 +200,17 @@ class VulkanLlamaBackend : InferenceBackend {
                         nBatch = model.batchSize,
                         nThreads = model.threads,
                         nGpuLayers = model.gpuLayers,
-                        useMmap = model.useMmap && engineConfig.enableMmap,
+                        useMmap = effectiveMmap,
                         useMlock = model.useMlock || engineConfig.enableMlock
                     )
                 } catch (e: CancellationException) {
                     runCatching { pfd.close() }
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     _lifecycleState.value = EngineLifecycleState.Initialized(versionInfo, capabilities)
                     throw e
                 } catch (t: Throwable) {
                     runCatching { pfd.close() }
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     val err = EngineError.GpuBackendError(
                         t.localizedMessage ?: "Vulkan native load failed",
                         fallbackEligible = true,
@@ -190,6 +223,7 @@ class VulkanLlamaBackend : InferenceBackend {
                 }
 
                 if (handle == 0L) {
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     val err = EngineError.GpuBackendError(
                         "ggml-vulkan failed to map ${model.displayName} (n_gpu_layers=${model.gpuLayers}).",
                         fallbackEligible = true
@@ -208,6 +242,7 @@ class VulkanLlamaBackend : InferenceBackend {
                 activeModelConfig = model
                 activeModelDetails = details
                 activeSessionId = null
+                activeMmapLease = lease
 
                 val ready = EngineLifecycleState.Ready(
                     modelId = model.modelId,
@@ -217,7 +252,7 @@ class VulkanLlamaBackend : InferenceBackend {
                     modelDetails = details
                 )
                 _lifecycleState.value = ready
-                Log.i(TAG, "Loaded Vulkan model ${model.displayName} ngl=${model.gpuLayers} n_ctx=${model.contextSize}")
+                Log.i(TAG, "Loaded Vulkan model ${model.displayName} ngl=${model.gpuLayers} n_ctx=${model.contextSize} mmap=$effectiveMmap")
                 ready
             }
         }
@@ -560,11 +595,16 @@ class VulkanLlamaBackend : InferenceBackend {
     private fun unloadLocked() {
         val prevModel = activeModelConfig?.modelId
         val handle = nativeHandle
-        if (handle != 0L) {
+        val leaseToRelease = activeMmapLease
+        if (handle != 0L || leaseToRelease != null) {
             _lifecycleState.value = EngineLifecycleState.Unloading(prevModel)
             nativeHandle = 0L
-            runCatching { VulkanNativeBridge.nativeUnload(handle) }
+            if (handle != 0L) {
+                runCatching { VulkanNativeBridge.nativeUnload(handle) }
+            }
         }
+        activeMmapLease = null
+        MmapLifecycleRegistry.releaseMapping(leaseToRelease)
         activeModelConfig = null
         activeModelDetails = null
         activeSessionId = null

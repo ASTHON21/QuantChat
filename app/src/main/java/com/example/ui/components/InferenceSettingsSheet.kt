@@ -65,6 +65,7 @@ import com.quantchat.engine.core.AcceleratorPreference
 import com.quantchat.engine.core.CpuScheduleMode
 import com.quantchat.hardware.CpuCoreTier
 import com.quantchat.hardware.ThermalSeverity
+import com.quantchat.integration.BackgroundServicesStatus
 import com.quantchat.resource.GpuOffloadPlanner
 import com.quantchat.resource.OrchestratorSnapshot
 import java.util.Locale
@@ -81,6 +82,7 @@ private val SYSTEM_PROMPT_PRESETS = listOf(
 fun InferenceSettingsSheet(
     currentSettings: InferenceSettings,
     orchestratorSnapshot: OrchestratorSnapshot? = null,
+    backgroundServicesStatus: BackgroundServicesStatus? = null,
     isModelReady: Boolean = false,
     onRefreshDiagnostics: () -> Unit = {},
     onRunBenchmark: () -> Unit = {},
@@ -88,6 +90,8 @@ fun InferenceSettingsSheet(
     onCancelCalibration: () -> Unit = {},
     onRunVulkanSelfTest: () -> Unit = {},
     onRunNpuProbe: () -> Unit = {},
+    onRunMaintenanceNow: () -> Unit = {},
+    onRequestNotificationsPermission: () -> Unit = {},
     onDismiss: () -> Unit,
     onApply: (InferenceSettings) -> Unit,
     onOpenVersionInfo: () -> Unit = {}
@@ -150,7 +154,9 @@ fun InferenceSettingsSheet(
             if (orchestratorSnapshot != null) {
                 HardwareCapabilitiesCard(
                     snapshot = orchestratorSnapshot,
+                    backgroundServicesStatus = backgroundServicesStatus,
                     acceleratorPreference = acceleratorPreference,
+                    contextSize = contextSize,
                     savedCalibratedThreads = currentSettings.calibratedOptimalThreads,
                     isModelReady = isModelReady,
                     onRefreshCapabilities = onRefreshDiagnostics,
@@ -158,7 +164,9 @@ fun InferenceSettingsSheet(
                     onCalibrateThreads = onCalibrateThreads,
                     onCancelCalibration = onCancelCalibration,
                     onRunVulkanSelfTest = onRunVulkanSelfTest,
-                    onRunNpuProbe = onRunNpuProbe
+                    onRunNpuProbe = onRunNpuProbe,
+                    onRunMaintenanceNow = onRunMaintenanceNow,
+                    onRequestNotificationsPermission = onRequestNotificationsPermission
                 )
             }
 
@@ -459,7 +467,9 @@ fun InferenceSettingsSheet(
 @Composable
 private fun HardwareCapabilitiesCard(
     snapshot: OrchestratorSnapshot,
+    backgroundServicesStatus: BackgroundServicesStatus?,
     acceleratorPreference: AcceleratorPreference,
+    contextSize: Int,
     savedCalibratedThreads: Int?,
     isModelReady: Boolean,
     onRefreshCapabilities: () -> Unit,
@@ -467,7 +477,9 @@ private fun HardwareCapabilitiesCard(
     onCalibrateThreads: () -> Unit,
     onCancelCalibration: () -> Unit,
     onRunVulkanSelfTest: () -> Unit,
-    onRunNpuProbe: () -> Unit
+    onRunNpuProbe: () -> Unit,
+    onRunMaintenanceNow: () -> Unit,
+    onRequestNotificationsPermission: () -> Unit
 ) {
     val profile = snapshot.hardwareProfile
     val metrics = snapshot.liveMetrics ?: profile?.liveMetrics
@@ -599,8 +611,27 @@ private fun HardwareCapabilitiesCard(
             deviceCapabilities = snapshot.deviceCapabilities,
             backendStatus = snapshot.backendRuntimeStatus,
             acceleratorPreference = acceleratorPreference,
+            mmapLifecycle = snapshot.mmapLifecycle,
             onRefreshCapabilities = onRefreshCapabilities
         )
+
+        ProcessAndAdmissionTelemetrySection(
+            liveMetrics = metrics,
+            lastAdmission = snapshot.lastAdmission,
+            contextSize = contextSize
+        )
+
+        ThermalStatusMatrixCard(
+            thermalState = snapshot.thermalState
+        )
+
+        if (backgroundServicesStatus != null) {
+            BackgroundServicesCard(
+                status = backgroundServicesStatus,
+                onRunMaintenanceNow = onRunMaintenanceNow,
+                onRequestNotificationsPermission = onRequestNotificationsPermission
+            )
+        }
 
         // Vulkan GPU & OpenCL Phase 2 Diagnostics Section
         val vk = snapshot.vulkanCapabilities ?: profile?.vulkanCapabilities

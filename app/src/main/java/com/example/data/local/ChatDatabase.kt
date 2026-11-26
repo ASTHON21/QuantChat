@@ -68,6 +68,9 @@ interface ChatDao {
     @Query("SELECT * FROM chat_messages WHERE threadId = :threadId ORDER BY timestampMs ASC")
     suspend fun getMessagesForThreadSync(threadId: String): List<ChatMessageEntity>
 
+    @Query("SELECT id FROM chat_threads")
+    suspend fun getAllThreadIdsSync(): List<String>
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertThreadIfAbsent(thread: ChatThreadEntity): Long
 
@@ -175,6 +178,10 @@ class ChatRepository(private val chatDao: ChatDao) {
 
     suspend fun getRecentMessagesSync(threadId: String): List<ChatMessage> {
         return chatDao.getMessagesForThreadSync(threadId).map { it.toDomain() }
+    }
+
+    suspend fun getAllThreadIdsSync(): Set<String> {
+        return chatDao.getAllThreadIdsSync().toSet()
     }
 
     private fun ChatThreadEntity.toDomain(): ChatThread = ChatThread(

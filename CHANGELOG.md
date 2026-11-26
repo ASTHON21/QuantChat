@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.10.0 (Build 11) - 2026-11-26
+
+### Phase 2.4: `ParcelFileDescriptor + mmap` File Lifecycle Governance
+- **File Integrity Verification (`model-manager` / `resource-manager`)**: Added `ModelFileVerifier` checking GGUF binary magic/version/tensor header bounds, exact byte size, and streaming SHA-256 digests (from Hugging Face `lfs.oid` and SAF imports), persisting `.verified.json` sidecar manifests and enforcing pre-load verification in `RuntimeOrchestrator`.
+- **OS `FileChannel` File Locking (`engine-core`)**: Added `MmapLifecycleRegistry` coordinating ref-counted shared read locks (`FileChannel.tryLock(..., shared = true)`) across active `mmap` leases with exclusive `.lck` write locks during downloads, SAF imports, and safe deletion.
+- **Unmap-Before-Unload Lifecycle (`engine-llamacpp` / `engine-vulkan`)**: Tracked `MmapLeaseHandle` and `ParcelFileDescriptor` ownership across native initialization and `unloadLocked()`, releasing native contexts, PFDs, and shared file locks deterministically on unload, fallback, or error.
+- **Download Interruption Recovery (`app` / `model-manager`)**: Persisted `.part.checkpoint.json` manifests (repo/URL, expected size, SHA-256, ETag, disk offset), handled HTTP `Range` + `If-Range` (`206` append, `200` reset, verification-gated `416` promotion), and restored paused downloads on cold start.
+- **Pre-Flight Storage Space Checks (`model-manager` / `app`)**: Added `StorageSpaceChecker` using Android `StatFs` with a 256 MiB / 5% safety buffer enforced prior to starting or resuming Hub downloads and SAF imports, surfaced via `DeviceStorageAndMmapCard` and Hub inspection warnings.
+- **Active-Mapping Pre-Delete Guard (`model-manager` / `app`)**: Added `ModelFileLifecycleManager.deleteSafely` refusing file deletion while any active `mmap` lease or exclusive lock is held, plus `ActiveMmapDeleteConfirmDialog` prompting users to stop & unload before deleting mapped weights.
+
+## v1.9.0 (Build 10) - 2026-11-26
+
+### Phase 2.3: Foreground Services & WorkManager Background Decoupling
+- **Activity-Independent Runtime (`app` / `system-integration`)**: Moved active download, model loading, and streaming inference execution into Application-scoped `QuantRuntimeHost` (`QuantChatApplication`) so `ViewModel.onCleared()` and Activity rotation no longer terminate active downloads or generation.
+- **`ModelDownloadService` (`dataSync` FGS)**: Added foreground service with `FOREGROUND_SERVICE_DATA_SYNC`, ongoing progress/speed notification, Pause/Cancel `PendingIntent` actions, and Android 15 `onTimeout()` pause compliance.
+- **`InferenceForegroundService` (`specialUse` FGS)**: Added foreground service with `FOREGROUND_SERVICE_SPECIAL_USE` and `PROPERTY_SPECIAL_USE_FGS_SUBTYPE`, live phase/token/backend notification, Stop action, and `onTaskRemoved()` persistence while inference is active.
+- **`ModelMaintenanceWorker` (`WorkManager`)**: Scheduled periodic 24h + 1-tap immediate maintenance sweeps for expired `.part` cleanup, GGUF binary header verification, orphaned KV-cache pruning (`SessionCacheManager.pruneOrphanedCaches`), and Thermal Guard `Result.retry()` deferral (strictly excluded from real-time token generation).
+- **Permissions & Background Launch Compliance**: Declared `FOREGROUND_SERVICE*` & `POST_NOTIFICATIONS` permissions, added Compose runtime notification permission request (`API 33+`), guarded background FGS starts against `ForegroundServiceStartNotAllowedException`, and surfaced `BackgroundServicesCard` in Inference Settings.
+
+## v1.8.0 (Build 9) - 2026-11-25
+
+### Phase 2.2: PowerManager Thermal Monitoring & 4-Tier Inference Governance
+- **4-Tier Thermal Policy (`engine-core` / `hardware-manager`)**: Added `ThermalInferenceAction`, `ThermalPolicyDecision`, `DeviceCapabilitiesPolicy.evaluateThermalPolicy()`, `EngineError.ThermalShutdown`, and `PowerManager.getThermalHeadroom` telemetry across `THERMAL_STATUS_NONE`, `LIGHT`, `MODERATE`, `SEVERE`, and `CRITICAL`.
+- **Load Reduction at `MODERATE`**: Automatically shifts scheduling to `THERMAL_SAFE` and halves Vulkan `n_gpu_layers` in `GpuOffloadPlanner`.
+- **Speed Pacing & Task Pause at `SEVERE`**: Routes inference to CPU-only with <=2 background threads, adds cooperative inter-token pacing (`ResilientFailoverBackend`), and pauses/blocks non-essential tasks (benchmarks, thread calibration sweeps, and active model downloads).
+- **Emergency Stop & Safe Release at `CRITICAL`**: Immediately cancels ongoing generation, blocks new inference, and calls `unloadModel()` inside `RuntimeOrchestrator` to safely release native weights & KV memory, surfaced via `ThermalStatusMatrixCard` and `ChatThermalGuardBanner`.
+
+## v1.7.0 (Build 8) - 2026-11-25
+
+### Phase 2.1: Memory Admission Control & 5-Term Runtime Budget
+- **5-Term Memory Admission Model (`resource-manager`)**: Added `MemoryAdmissionPlanner` and `MemoryBudgetBreakdown` calculating `M_total = M_weights + M_KV + M_compute + M_runtime + M_reserve` from GGUF layer/KV/embedding metadata, `n_ctx`, `n_batch`, GPU offload staging, and Android LMK reserve thresholds instead of relying on nominal device RAM.
+- **OS & Process Memory Probing (`hardware-manager`)**: Added `ProcessMemoryProbe` and `ProcessMemoryTelemetry` reading `ActivityManager.MemoryInfo` (`availMem`, `threshold`, `lowMemory`, `memoryClass`), `ActivityManager.getProcessMemoryInfo` (`totalPss`), native heap allocated size, and `/proc/self/status` `VmRSS`.
+- **Strict Pre-Load Gate & Auto-Downgrade (`resource-manager` / `app`)**: Enforced `AdmissionVerdict.BLOCKED` inside `RuntimeOrchestrator.loadModel()` before native allocation, computing concrete safe downgrade candidates (`n_ctx` reduction and/or CPU-only 0 GPU layers).
+- **Admission Diagnostics & Recovery UI (`app`)**: Added `MemoryAdmissionBreakdownStrip` on local GGUF cards, `ProcessAndAdmissionTelemetrySection` in Inference Settings, and `MemoryAdmissionBlockedDialog` with one-tap **Downgrade & Load**.
+
 ## v1.6.0 (Build 7) - 2026-11-25
 
 ### Phase 1.4: Unified Hardware Scheduling Interface (`DeviceCapabilities`)

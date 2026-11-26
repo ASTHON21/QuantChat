@@ -4,6 +4,7 @@ import com.quantchat.engine.core.AcceleratorPreference
 import com.quantchat.engine.core.CpuScheduleMode
 import com.quantchat.engine.core.EngineModelDetails
 import com.quantchat.model.GgufHeaderMetadata
+import com.quantchat.model.VerifiedArtifactManifest
 import com.quantchat.resource.AdmissionAssessment
 
 // --- Local Chat & Persistence Models ---
@@ -104,7 +105,8 @@ data class ModelFileArtifact(
     val rfilename: String,
     val sizeBytes: Long,
     val quantTag: String,
-    val downloadUrl: String
+    val downloadUrl: String,
+    val sha256: String? = null
 )
 
 data class HubModelItem(
@@ -146,7 +148,9 @@ data class ActiveDownloadState(
     val speedBytesPerSec: Long = 0L,
     val etaSeconds: Int = 0,
     val phase: DownloadPhase = DownloadPhase.IDLE,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val pausedByThermal: Boolean = false,
+    val expectedSha256: String? = null
 ) {
     val progressFraction: Float
         get() = if (totalBytes > 0L) (bytesDownloaded.toDouble() / totalBytes.toDouble()).toFloat().coerceIn(0f, 1f) else 0f
@@ -163,8 +167,20 @@ data class LocalWeightFile(
     val isPartial: Boolean,
     val downloadUrl: String? = null,
     val headerMetadata: GgufHeaderMetadata? = null,
-    val admission: AdmissionAssessment? = null
+    val admission: AdmissionAssessment? = null,
+    val expectedTotalBytes: Long? = null,
+    val expectedSha256: String? = null,
+    val verifiedManifest: VerifiedArtifactManifest? = null,
+    val hasActiveMmapLease: Boolean = false
 ) {
+    val partialProgressFraction: Float?
+        get() = if (isPartial && expectedTotalBytes != null && expectedTotalBytes > 0L) {
+            (sizeBytes.toDouble() / expectedTotalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+        } else null
+
+    val partialProgressPercent: Int?
+        get() = partialProgressFraction?.let { (it * 100f).toInt() }
+
     val quantTag: String
         get() {
             val upper = displayFileName.uppercase()

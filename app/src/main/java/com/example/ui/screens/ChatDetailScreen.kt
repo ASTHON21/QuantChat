@@ -70,6 +70,7 @@ import com.example.data.ChatThread
 import com.example.data.InferenceSettings
 import com.example.data.LocalRuntimeState
 import com.example.data.LocalWeightFile
+import com.example.ui.components.ChatThermalGuardBanner
 import com.example.ui.theme.QuantEmerald
 import com.example.ui.theme.QuantEmeraldContainer
 import com.example.ui.theme.QuantError
@@ -407,8 +408,8 @@ fun ChatDetailScreen(
                         val isFallback = backendStatus?.fallbackOccurred == true
                         val accelLabel = when {
                             isGpuActive -> {
-                                val applied = backendStatus?.appliedGpuLayers ?: 0
-                                val total = backendStatus?.totalModelLayers ?: 0
+                                val applied = backendStatus.appliedGpuLayers
+                                val total = backendStatus.totalModelLayers
                                 if (total > 0 && applied >= total) "GPU · VK FULL"
                                 else if (total > 0) "GPU · VK ${applied}/${total}L"
                                 else "GPU · VK ${applied}L"
@@ -467,7 +468,7 @@ fun ChatDetailScreen(
                                 Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
                                     Text(
                                         text = if (isGpuActive) {
-                                            "BACKEND · ${backendStatus?.activeDeviceLabel ?: "VULKAN GPU"}"
+                                            "BACKEND · ${backendStatus.activeDeviceLabel}"
                                         } else {
                                             "BACKEND · ${backendStatus?.statusSummary ?: "CPU SAFE"}"
                                         },
@@ -475,8 +476,8 @@ fun ChatDetailScreen(
                                         color = accelColor
                                     )
                                     val detailText = when {
-                                        isFallback && !backendStatus?.fallbackReason.isNullOrBlank() ->
-                                            "Fallback: ${backendStatus?.fallbackReason}"
+                                        isFallback && !backendStatus.fallbackReason.isNullOrBlank() ->
+                                            "Fallback: ${backendStatus.fallbackReason}"
                                         probe != null ->
                                             probe.deviceName?.let { "$it · ${probe.selfTestSummary}" } ?: probe.selfTestSummary
                                         else -> "Vulkan capability probe pending"
@@ -547,7 +548,7 @@ fun ChatDetailScreen(
                         val effectiveMode = decision?.effectiveMode ?: inferenceSettings.scheduleMode
                         val effectiveThreads = decision?.effectiveThreads ?: inferenceSettings.threads
                         val isThrottled = decision?.isThermallyThrottled == true
-                        val pillLabel = if (isThrottled && decision?.requestedMode != CpuScheduleMode.THERMAL_SAFE) {
+                        val pillLabel = if (isThrottled && decision.requestedMode != CpuScheduleMode.THERMAL_SAFE) {
                             "THERMAL SAFE · ${effectiveThreads}T (AUTO)"
                         } else {
                             "${effectiveMode.label.uppercase(Locale.US)} · ${effectiveThreads}T"
@@ -709,6 +710,10 @@ fun ChatDetailScreen(
                             }
                         )
                     }
+                }
+
+                orchestratorSnapshot?.thermalState?.let { thermal ->
+                    ChatThermalGuardBanner(thermalState = thermal)
                 }
             }
 

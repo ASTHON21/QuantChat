@@ -19,10 +19,59 @@ object AppReleaseInfo {
 
     val changelog: List<ReleaseChangelogEntry> = listOf(
         ReleaseChangelogEntry(
+            version = "v1.10.0",
+            buildNumber = 11,
+            date = "2026-11-26",
+            badge = "CURRENT",
+            highlights = listOf(
+                "Phase 2.4: Retained ParcelFileDescriptor + mmap model loading with full file lifecycle governance across download, verification, mapping, unload, and safe deletion.",
+                "Added GGUF structural header + Hugging Face LFS SHA-256 verification (ModelFileVerifier & .verified.json sidecars) enforcing pre-load integrity checks in RuntimeOrchestrator and on-demand Verify actions.",
+                "Added OS FileChannel FileLock coordination (MmapLifecycleRegistry) pairing ref-counted shared read locks during active mmap leases with exclusive .lck write locks during downloads, SAF imports, and deletion.",
+                "Tracked ParcelFileDescriptor & mmap leases in LlamaCppBackend and VulkanLlamaBackend so unloadModel() cleanly closes native contexts, PFDs, and FileLocks before releasing storage, plus active-mapping guards blocking deletion until unloaded.",
+                "Added persistent .part.checkpoint.json manifests with HTTP Range/If-Range resume recovery (206 append, 200 reset, verified 416 promotion) and StatFs storage space checks with 256 MiB / 5% safety buffers."
+            )
+        ),
+        ReleaseChangelogEntry(
+            version = "v1.9.0",
+            buildNumber = 10,
+            date = "2026-11-26",
+            badge = "RELEASED",
+            highlights = listOf(
+                "Phase 2.3: Decoupled long-running GGUF downloads and local LLM inference from Activity/ViewModel lifecycles via Application-scoped QuantRuntimeHost and Android Foreground Services.",
+                "Added ModelDownloadService (foregroundServiceType=\"dataSync\") with live progress notifications, Pause/Cancel notification actions, and Android 15 onTimeout safety handling.",
+                "Added InferenceForegroundService (foregroundServiceType=\"specialUse\" with PROPERTY_SPECIAL_USE_FGS_SUBTYPE) displaying live token/backend telemetry, Stop action, and background survival on Activity rotation or task removal.",
+                "Added ModelMaintenanceWorker via WorkManager for deferrable 24h storage cleanup (expired .part removal, GGUF magic check, orphan KV cache pruning, and catalog check) with Thermal Guard deferral, plus Android 13+ POST_NOTIFICATIONS & FGS background launch compliance."
+            )
+        ),
+        ReleaseChangelogEntry(
+            version = "v1.8.0",
+            buildNumber = 9,
+            date = "2026-11-25",
+            badge = "RELEASED",
+            highlights = listOf(
+                "Phase 2.2: Implemented 4-tier Android PowerManager Thermal API governance covering THERMAL_STATUS_NONE / LIGHT / MODERATE / SEVERE / CRITICAL and PowerManager thermal headroom forecasting.",
+                "MODERATE thermal state automatically reduces CPU threads (Thermal Safe) and halves GPU layer offload (n_gpu_layers) in GpuOffloadPlanner.",
+                "SEVERE thermal state enforces CPU-only execution, throttles token generation speed via inter-token pacing delays, and pauses non-essential tasks (thread calibration, hardware benchmarks, and active Hub downloads).",
+                "CRITICAL thermal state immediately stops active inference (EngineError.ThermalShutdown), cancels pending tasks, and safely unloads the active llama.cpp / Vulkan context to release memory, with live status matrix and chat thermal banners."
+            )
+        ),
+        ReleaseChangelogEntry(
+            version = "v1.7.0",
+            buildNumber = 8,
+            date = "2026-11-25",
+            badge = "RELEASED",
+            highlights = listOf(
+                "Phase 2.1: Implemented 5-term memory admission planning (M_total = M_weights + M_KV + M_compute + M_runtime + M_reserve) using GGUF architecture dimensions, context window, batch size, and Vulkan GPU staging costs.",
+                "Added ProcessMemoryProbe in :hardware-manager combining ActivityManager.MemoryInfo (availMem, threshold, lowMemory, memoryClass), process PSS, native heap allocation, and /proc/self/status VmRSS.",
+                "Added strict pre-load admission gating in RuntimeOrchestrator throwing EngineError.InsufficientMemory before native llama.cpp allocation when headroom is exceeded, with automated safe n_ctx / CPU-only downgrade suggestions.",
+                "Added 5-term memory admission breakdown pills on downloaded model cards, live process telemetry in Inference Settings, and an interactive Blocked Admission recovery dialog with 1-tap Downgrade & Load."
+            )
+        ),
+        ReleaseChangelogEntry(
             version = "v1.6.0",
             buildNumber = 7,
             date = "2026-11-25",
-            badge = "CURRENT",
+            badge = "RELEASED",
             highlights = listOf(
                 "Phase 1.4: Added canonical DeviceCapabilities schema and HardwareCapabilityProvider contract in :engine-core with both reactive StateFlow updates and synchronous getDeviceCapabilities() snapshots.",
                 "Upgraded HardwareCapabilityManager to maintain and emit live unified CPU, SIMD, GPU, NPU, memory, and integer thermal status snapshots across probes and PowerManager thermal callbacks.",

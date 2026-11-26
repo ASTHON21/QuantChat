@@ -277,6 +277,22 @@ sealed class EngineError(
     class Cancelled(
         val reason: String = "Operation cancelled"
     ) : EngineError(reason)
+
+    class ThermalShutdown(
+        val thermalStatus: Int,
+        val reason: String
+    ) : EngineError("Thermal shutdown (status=$thermalStatus): $reason")
+
+    class FileLocked(
+        val fileName: String,
+        val reason: String
+    ) : EngineError("$fileName is currently locked: $reason")
+
+    class InsufficientStorage(
+        val requiredMb: Long,
+        val availableMb: Long,
+        val reason: String
+    ) : EngineError("Insufficient storage (~${requiredMb}MB needed, ${availableMb}MB available): $reason")
 }
 
 data class EngineConfig(

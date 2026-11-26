@@ -18,5 +18,8 @@ android {
 
 dependencies {
     api(project(":engine-core"))
+    api(libs.androidx.work.runtime.ktx)
     implementation(libs.androidx.core.ktx)
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.kotlinx.coroutines.core)
 }

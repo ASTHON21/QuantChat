@@ -3,6 +3,7 @@ package com.quantchat.resource
 import com.quantchat.engine.core.AcceleratorPreference
 import com.quantchat.engine.core.VulkanProbeResult
 import com.quantchat.engine.core.VulkanProbeStatus
+import com.quantchat.hardware.ThermalSeverity
 import com.quantchat.model.GgufHeaderMetadata
 import java.util.Locale
 import kotlin.math.max
@@ -34,7 +35,8 @@ object GpuOffloadPlanner {
         vulkanProbe: VulkanProbeResult?,
         preference: AcceleratorPreference,
         autoOffload: Boolean,
-        manualLayersOverride: Int
+        manualLayersOverride: Int,
+        thermalSeverity: ThermalSeverity = ThermalSeverity.NOMINAL
     ): GpuOffloadPlan {
         val totalLayers = (header?.blockCount ?: DEFAULT_LAYER_COUNT).coerceIn(1, 128)
         val clampedManual = manualLayersOverride.coerceIn(0, totalLayers)
@@ -75,17 +77,36 @@ object GpuOffloadPlanner {
             (budgetForLayersMb.toDouble() / perLayerMb).toInt().coerceIn(0, totalLayers)
         }
 
-        val recommendedLayers = when {
+        val baseRecommendedLayers = when {
             preference == AcceleratorPreference.CPU_ONLY -> 0
             vulkanUsable -> memoryRecommendedLayers
             preference == AcceleratorPreference.PREFER_VULKAN -> memoryRecommendedLayers
             else -> 0
         }
 
-        val effectiveLayers = when {
+        val thermalScale = when (thermalSeverity) {
+            ThermalSeverity.CRITICAL, ThermalSeverity.SEVERE -> 0f
+            ThermalSeverity.MODERATE -> 0.5f
+            else -> 1.0f
+        }
+
+        val recommendedLayers = when {
+            thermalScale <= 0f -> 0
+            thermalScale < 1.0f && baseRecommendedLayers > 0 ->
+                (baseRecommendedLayers * thermalScale).toInt().coerceAtLeast(1)
+            else -> baseRecommendedLayers
+        }
+
+        val rawEffectiveLayers = when {
             preference == AcceleratorPreference.CPU_ONLY -> 0
             autoOffload -> recommendedLayers
             else -> clampedManual
+        }
+        val effectiveLayers = when {
+            thermalScale <= 0f -> 0
+            !autoOffload && thermalScale < 1.0f && rawEffectiveLayers > 0 ->
+                (rawEffectiveLayers * thermalScale).toInt().coerceAtLeast(1)
+            else -> rawEffectiveLayers
         }
 
         val offloadWeightMb = (effectiveLayers * perLayerMb).toLong().coerceAtMost(weightsMb)
@@ -95,12 +116,21 @@ object GpuOffloadPlanner {
         val summary = when {
             preference == AcceleratorPreference.CPU_ONLY ->
                 "CPU Only selected · 0/${totalLayers}L offloaded"
+            thermalSeverity == ThermalSeverity.CRITICAL || thermalSeverity == ThermalSeverity.SEVERE ->
+                "Thermal ${thermalSeverity.label}: GPU offload paused (0/${totalLayers}L)"
             lowMemory ->
                 "Low memory flag active · holding 0/${totalLayers}L on GPU"
             !vulkanUsable -> {
                 val reason = vulkanProbe?.status?.label ?: VulkanProbeStatus.NATIVE_LIBRARY_MISSING.label
                 "$reason · CPU safe fallback ready"
             }
+            thermalSeverity == ThermalSeverity.MODERATE && effectiveLayers > 0 -> String.format(
+                Locale.US,
+                "Thermal Moderate: GPU load halved (%d/%dL · ~%dMB VRAM)",
+                effectiveLayers,
+                totalLayers,
+                estimatedGpuMb
+            )
             autoOffload -> String.format(
                 Locale.US,
                 "Auto RAM/VRAM: %d/%dL GPU (~%dMB VRAM · %dMB CPU headroom)",

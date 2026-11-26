@@ -14,6 +14,8 @@ import com.quantchat.engine.core.EngineVersionInfo
 import com.quantchat.engine.core.GenerationEvent
 import com.quantchat.engine.core.GenerationRequest
 import com.quantchat.engine.core.InferenceBackend
+import com.quantchat.engine.core.MmapLifecycleRegistry
+import com.quantchat.engine.core.MmapLifecycleSnapshot
 import com.quantchat.engine.core.ModelConfig
 import com.quantchat.engine.core.ModelId
 import com.quantchat.engine.core.NpuCompatibilityReport
@@ -26,14 +28,18 @@ import com.quantchat.hardware.DeviceHardwareProfile
 import com.quantchat.hardware.HardwareCapabilityManager
 import com.quantchat.hardware.LiveDeviceMetrics
 import com.quantchat.hardware.ThermalSeverity
+import com.quantchat.model.DownloadCheckpointStore
 import com.quantchat.model.GgufHeaderMetadata
 import com.quantchat.model.LocalModelRegistry
+import com.quantchat.model.ModelFileVerifier
+import com.quantchat.model.ModelVerificationResult
 import com.quantchat.session.ContextBudgetSnapshot
 import com.quantchat.session.SessionCacheManager
 import com.quantchat.session.SessionCacheMetadata
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
@@ -73,7 +79,9 @@ data class OrchestratorSnapshot(
     val manualGpuLayers: Int = 0,
     val npuCapabilities: NpuProbeResult? = null,
     val npuCompatibilityReport: NpuCompatibilityReport? = null,
-    val deviceCapabilities: DeviceCapabilities? = null
+    val deviceCapabilities: DeviceCapabilities? = null,
+    val thermalState: ThermalRuntimeActionState = ThermalRuntimeActionState(),
+    val mmapLifecycle: MmapLifecycleSnapshot = MmapLifecycleSnapshot()
 )
 
 data class ModelLoadOutcome(
@@ -90,7 +98,9 @@ class RuntimeOrchestrator(
     private val sessionManager: SessionCacheManager,
     vulkanBackend: InferenceBackend? = null,
     vulkanProbeProvider: (suspend () -> VulkanProbeResult)? = null,
-    private val npuBackend: NpuInferenceBackend? = null
+    private val npuBackend: NpuInferenceBackend? = null,
+    severeThermalPacingMs: Long = com.quantchat.engine.core.DeviceCapabilitiesPolicy.SEVERE_TOKEN_PACING_DELAY_MS,
+    private val strictArtifactVerification: Boolean = false
 ) {
     private val resilientBackend: ResilientFailoverBackend = if (primaryBackend is ResilientFailoverBackend) {
         primaryBackend
@@ -100,7 +110,8 @@ class RuntimeOrchestrator(
             primaryGpuBackend = vulkanBackend,
             probeProvider = vulkanProbeProvider ?: { hardwareManager.probeVulkanCapabilities() },
             npuBackend = npuBackend,
-            capabilityProvider = hardwareManager
+            capabilityProvider = hardwareManager,
+            severeThermalPacingMs = severeThermalPacingMs
         )
     }
 
@@ -129,13 +140,29 @@ class RuntimeOrchestrator(
     @Volatile
     private var calibrationCancelRequested: Boolean = false
 
+    @Volatile
+    private var emergencyReleaseCount: Int = 0
+
+    @Volatile
+    private var lastThermalEventNote: String? = null
+
+    private var emergencyThermalJob: Job? = null
+
     private val _snapshot = MutableStateFlow(
         OrchestratorSnapshot(
             lifecycleState = resilientBackend.lifecycleState.value,
             versionInfo = resilientBackend.versionInfo,
             capabilities = resilientBackend.capabilities,
             backendRuntimeStatus = resilientBackend.runtimeStatus.value,
-            deviceCapabilities = hardwareManager.deviceCapabilities.value
+            deviceCapabilities = hardwareManager.deviceCapabilities.value,
+            thermalState = ThermalGovernor.evaluate(
+                severity = hardwareManager.thermalSeverityFlow.value,
+                deviceCapabilities = hardwareManager.deviceCapabilities.value,
+                liveMetrics = null,
+                autoProtectionEnabled = true,
+                requestedThreads = 4
+            ),
+            mmapLifecycle = MmapLifecycleRegistry.snapshot.value
         )
     )
     val snapshot: StateFlow<OrchestratorSnapshot> = _snapshot.asStateFlow()
@@ -150,6 +177,13 @@ class RuntimeOrchestrator(
             hardwareManager.deviceCapabilities.collect { caps ->
                 _snapshot.update { current ->
                     current.copy(deviceCapabilities = caps)
+                }
+            }
+        }
+        orchestratorScope.launch {
+            MmapLifecycleRegistry.snapshot.collect { mmapState ->
+                _snapshot.update { current ->
+                    current.copy(mmapLifecycle = mmapState)
                 }
             }
         }
@@ -224,6 +258,7 @@ class RuntimeOrchestrator(
         val profile = hardwareManager.probeHardware(resilientBackend.capabilities)
         val probe = profile.vulkanCapabilities ?: resilientBackend.lastProbeResult.value
         val npuProbe = profile.npuCapabilities
+        val caps = hardwareManager.getDeviceCapabilities()
         _snapshot.update { current ->
             val decision = computeDecisionLocked(
                 profile = profile,
@@ -233,6 +268,12 @@ class RuntimeOrchestrator(
             val previews = computeModePreviewsLocked(profile, profile.liveMetrics.thermalSeverity)
             val offloadPlan = computeOffloadPlanLocked(profile.liveMetrics, probe)
             val compatReport = computeCompatibilityReportLocked(npuProbe, probe)
+            val thermalState = buildThermalStateLocked(
+                severity = profile.liveMetrics.thermalSeverity,
+                caps = caps,
+                metrics = profile.liveMetrics,
+                fallbackThreads = decision.effectiveThreads
+            )
             current.copy(
                 lifecycleState = resilientBackend.lifecycleState.value,
                 versionInfo = resilientBackend.versionInfo,
@@ -252,7 +293,8 @@ class RuntimeOrchestrator(
                 manualGpuLayers = manualGpuLayers,
                 npuCapabilities = npuProbe,
                 npuCompatibilityReport = compatReport,
-                deviceCapabilities = hardwareManager.getDeviceCapabilities()
+                deviceCapabilities = caps,
+                thermalState = thermalState
             )
         }
         return profile
@@ -261,13 +303,62 @@ class RuntimeOrchestrator(
     suspend fun inspectModelMetadata(diskFileName: String): GgufHeaderMetadata? =
         modelRegistry.inspectHeader(diskFileName)
 
+    suspend fun verifyModelFile(
+        diskFile: File,
+        expectedSizeBytes: Long? = null,
+        expectedSha256: String? = null,
+        computeSha256: Boolean = true
+    ): ModelVerificationResult {
+        val savedManifest = DownloadCheckpointStore.readVerifiedManifest(diskFile)
+        val result = ModelFileVerifier.verifyComplete(
+            file = diskFile,
+            expectedSizeBytes = expectedSizeBytes ?: savedManifest?.expectedSizeBytes,
+            expectedSha256 = expectedSha256 ?: savedManifest?.expectedSha256,
+            computeSha256 = computeSha256
+        )
+        if (result.isValid) {
+            DownloadCheckpointStore.writeVerifiedManifest(diskFile, result)
+        }
+        return result
+    }
+
     fun assessAdmission(
         diskFile: File,
         header: GgufHeaderMetadata?,
-        contextSize: Int
+        contextSize: Int,
+        plannedGpuLayers: Int? = null,
+        totalLayers: Int? = null
     ): AdmissionAssessment {
         val metrics = resourceManager.liveMetrics()
-        val assessment = resourceManager.assessModelAdmission(diskFile, header, contextSize, metrics)
+        val probe = _snapshot.value.vulkanCapabilities ?: _snapshot.value.hardwareProfile?.vulkanCapabilities
+        val candidatePlan = if (plannedGpuLayers == null) {
+            synchronized(configLock) {
+                GpuOffloadPlanner.planOffload(
+                    fileSizeBytes = diskFile.length().coerceAtLeast(0L),
+                    header = header,
+                    contextSize = contextSize,
+                    availableRamMb = metrics.availableRamMb,
+                    lowMemory = metrics.lowMemory,
+                    vulkanProbe = probe,
+                    preference = acceleratorPreference,
+                    autoOffload = autoGpuLayerOffload,
+                    manualLayersOverride = manualGpuLayers,
+                    thermalSeverity = if (autoThermalDownshift) metrics.thermalSeverity else ThermalSeverity.NOMINAL
+                )
+            }
+        } else {
+            null
+        }
+        val effectiveGpu = plannedGpuLayers ?: candidatePlan?.effectiveLayers ?: 0
+        val resolvedTotalLayers = totalLayers ?: candidatePlan?.totalLayers ?: header?.blockCount ?: 32
+        val assessment = resourceManager.assessModelAdmission(
+            file = diskFile,
+            header = header,
+            contextSize = contextSize,
+            metrics = metrics,
+            plannedGpuLayers = effectiveGpu,
+            totalLayers = resolvedTotalLayers
+        )
         _snapshot.update { it.copy(liveMetrics = metrics, lastAdmission = assessment) }
         return assessment
     }
@@ -279,10 +370,78 @@ class RuntimeOrchestrator(
         contextSize: Int,
         threads: Int
     ): ModelLoadOutcome = operationMutex.withLock {
+        if (MmapLifecycleRegistry.isWriteLocked(diskFile)) {
+            throw EngineError.FileLocked(
+                fileName = displayName,
+                reason = "Model file is locked by an ongoing write or integrity check."
+            )
+        }
+        if (strictArtifactVerification) {
+            val savedManifest = DownloadCheckpointStore.readVerifiedManifest(diskFile)
+            val verification = ModelFileVerifier.verifyComplete(
+                file = diskFile,
+                expectedSizeBytes = savedManifest?.expectedSizeBytes,
+                expectedSha256 = savedManifest?.expectedSha256,
+                computeSha256 = false
+            )
+            if (!verification.isValid) {
+                throw EngineError.InvalidModelFormat(
+                    fileName = displayName,
+                    reason = verification.failureReason ?: "Model file failed integrity check (${verification.verdict.label})."
+                )
+            }
+            if (savedManifest == null) {
+                DownloadCheckpointStore.writeVerifiedManifest(diskFile, verification)
+            }
+        }
         val header = modelRegistry.inspectHeader(diskFile.name)
-        val admission = assessAdmission(diskFile, header, contextSize)
         val profile = _snapshot.value.hardwareProfile ?: hardwareManager.probeHardware(resilientBackend.capabilities)
         val live = resourceManager.liveMetrics()
+        val thermalAuto = synchronized(configLock) { autoThermalDownshift }
+        if (thermalAuto && live.thermalSeverity == ThermalSeverity.CRITICAL) {
+            throw EngineError.ThermalShutdown(
+                thermalStatus = live.thermalSeverity.statusCode,
+                reason = "Device is in CRITICAL thermal state; model loading is paused to protect hardware."
+            )
+        }
+        val probe = profile.vulkanCapabilities ?: resilientBackend.probeVulkan()
+        val candidateOffloadPlan = synchronized(configLock) {
+            GpuOffloadPlanner.planOffload(
+                fileSizeBytes = diskFile.length().coerceAtLeast(0L),
+                header = header,
+                contextSize = contextSize,
+                availableRamMb = live.availableRamMb,
+                lowMemory = live.lowMemory,
+                vulkanProbe = probe,
+                preference = acceleratorPreference,
+                autoOffload = autoGpuLayerOffload,
+                manualLayersOverride = manualGpuLayers,
+                thermalSeverity = if (autoThermalDownshift) live.thermalSeverity else ThermalSeverity.NOMINAL
+            )
+        }
+
+        val admission = assessAdmission(
+            diskFile = diskFile,
+            header = header,
+            contextSize = contextSize,
+            plannedGpuLayers = candidateOffloadPlan.effectiveLayers,
+            totalLayers = candidateOffloadPlan.totalLayers
+        )
+        if (admission.verdict == AdmissionVerdict.BLOCKED) {
+            _snapshot.update {
+                it.copy(
+                    liveMetrics = live,
+                    lastAdmission = admission,
+                    gpuOffloadPlan = candidateOffloadPlan
+                )
+            }
+            throw EngineError.InsufficientMemory(
+                requiredMb = admission.estimatedMemoryMb,
+                availableMb = admission.availableMemoryMb,
+                reason = admission.blockReason ?: admission.summary
+            )
+        }
+
         val decision = computeDecisionLocked(
             profile = profile,
             thermal = live.thermalSeverity,
@@ -298,7 +457,6 @@ class RuntimeOrchestrator(
             activeModelContextSize = contextSize
         }
 
-        val probe = profile.vulkanCapabilities ?: resilientBackend.probeVulkan()
         val npuProbe = profile.npuCapabilities ?: hardwareManager.probeNpuCapabilities()
         val offloadPlan = computeOffloadPlanLocked(live, probe)
 
@@ -383,6 +541,13 @@ class RuntimeOrchestrator(
             contextSize = contextSize
         )
         val metrics = resourceManager.liveMetrics()
+        val thermalAuto = synchronized(configLock) { autoThermalDownshift }
+        if (thermalAuto && metrics.thermalSeverity == ThermalSeverity.CRITICAL) {
+            throw EngineError.ThermalShutdown(
+                thermalStatus = metrics.thermalSeverity.statusCode,
+                reason = "Inference stopped: device reached CRITICAL thermal status."
+            )
+        }
         val profile = _snapshot.value.hardwareProfile ?: hardwareManager.probeHardware(resilientBackend.capabilities)
         val decision = synchronized(configLock) {
             lastWorkload = workload
@@ -392,6 +557,8 @@ class RuntimeOrchestrator(
                 workload = workload
             )
         }
+        val caps = hardwareManager.getDeviceCapabilities()
+        val thermalState = buildThermalStateLocked(metrics.thermalSeverity, caps, metrics, decision.effectiveThreads)
 
         _snapshot.update {
             it.copy(
@@ -402,7 +569,9 @@ class RuntimeOrchestrator(
                 recommendedThreads = decision.effectiveThreads,
                 schedulingDecision = decision,
                 modeThreadPreview = computeModePreviewsLocked(profile, metrics.thermalSeverity),
-                backendRuntimeStatus = resilientBackend.runtimeStatus.value
+                backendRuntimeStatus = resilientBackend.runtimeStatus.value,
+                deviceCapabilities = caps,
+                thermalState = thermalState
             )
         }
 
@@ -490,13 +659,23 @@ class RuntimeOrchestrator(
                     backendRuntimeStatus = resilientBackend.runtimeStatus.value,
                     gpuOffloadPlan = computeOffloadPlanLocked(metrics, probe),
                     npuCompatibilityReport = null,
-                    deviceCapabilities = hardwareManager.getDeviceCapabilities()
+                    deviceCapabilities = hardwareManager.getDeviceCapabilities(),
+                    mmapLifecycle = MmapLifecycleRegistry.snapshot.value
                 )
             }
         }
     }
 
     suspend fun runBenchmark(): BenchmarkResult = operationMutex.withLock {
+        val preMetrics = resourceManager.liveMetrics()
+        val thermalAuto = synchronized(configLock) { autoThermalDownshift }
+        if (thermalAuto && (preMetrics.thermalSeverity == ThermalSeverity.SEVERE ||
+                preMetrics.thermalSeverity == ThermalSeverity.CRITICAL)
+        ) {
+            throw EngineError.GenerationFailed(
+                "Benchmark paused by Thermal Guard (${preMetrics.thermalSeverity.label}). Wait for device to cool."
+            )
+        }
         _snapshot.update { it.copy(isBenchmarking = true) }
         try {
             val activeThreads = _snapshot.value.schedulingDecision?.effectiveThreads
@@ -532,6 +711,15 @@ class RuntimeOrchestrator(
     }
 
     suspend fun calibrateOptimalThreads(): ThreadCalibrationResult = operationMutex.withLock {
+        val preMetrics = resourceManager.liveMetrics()
+        val thermalAuto = synchronized(configLock) { autoThermalDownshift }
+        if (thermalAuto && (preMetrics.thermalSeverity == ThermalSeverity.SEVERE ||
+                preMetrics.thermalSeverity == ThermalSeverity.CRITICAL)
+        ) {
+            throw EngineError.GenerationFailed(
+                "Calibration paused by Thermal Guard (${preMetrics.thermalSeverity.label}). Non-essential sweeps suspended."
+            )
+        }
         calibrationCancelRequested = false
         val profile = _snapshot.value.hardwareProfile ?: hardwareManager.probeHardware(resilientBackend.capabilities)
         val candidates = resourceManager.buildCalibrationCandidates(profile)
@@ -553,8 +741,11 @@ class RuntimeOrchestrator(
 
         try {
             candidates.forEachIndexed { index, threadCount ->
-                if (calibrationCancelRequested) {
-                    throw CancellationException("Thread calibration cancelled.")
+                val loopThermal = resourceManager.liveMetrics().thermalSeverity
+                if (calibrationCancelRequested || (synchronized(configLock) { autoThermalDownshift } &&
+                        (loopThermal == ThermalSeverity.SEVERE || loopThermal == ThermalSeverity.CRITICAL))
+                ) {
+                    throw CancellationException("Thread calibration paused due to ${loopThermal.label} thermal state.")
                 }
                 _snapshot.update {
                     it.copy(
@@ -691,25 +882,74 @@ class RuntimeOrchestrator(
     }
 
     private fun updateThermalInSnapshot(severity: ThermalSeverity) {
+        val thermalAuto = synchronized(configLock) { autoThermalDownshift }
+        if (thermalAuto && (severity == ThermalSeverity.SEVERE || severity == ThermalSeverity.CRITICAL)) {
+            calibrationCancelRequested = true
+        }
+        val caps = hardwareManager.getDeviceCapabilities()
         _snapshot.update { current ->
             val currentMetrics = current.liveMetrics ?: resourceManager.liveMetrics()
             val updatedMetrics = currentMetrics.copy(thermalSeverity = severity)
             val profile = current.hardwareProfile
+            val probe = profile?.vulkanCapabilities ?: current.vulkanCapabilities
+            val offloadPlan = computeOffloadPlanLocked(updatedMetrics, probe)
             if (profile == null) {
+                val thermalState = buildThermalStateLocked(severity, caps, updatedMetrics, current.recommendedThreads)
                 current.copy(
                     liveMetrics = updatedMetrics,
                     requestedScheduleMode = requestedMode,
-                    autoThermalDownshift = autoThermalDownshift
+                    autoThermalDownshift = autoThermalDownshift,
+                    gpuOffloadPlan = offloadPlan,
+                    deviceCapabilities = caps,
+                    thermalState = thermalState
                 )
             } else {
                 val decision = computeDecisionLocked(profile, severity, lastWorkload)
+                val thermalState = buildThermalStateLocked(severity, caps, updatedMetrics, decision.effectiveThreads)
                 current.copy(
                     liveMetrics = updatedMetrics,
                     recommendedThreads = decision.effectiveThreads,
                     requestedScheduleMode = requestedMode,
                     autoThermalDownshift = autoThermalDownshift,
                     schedulingDecision = decision,
-                    modeThreadPreview = computeModePreviewsLocked(profile, severity)
+                    modeThreadPreview = computeModePreviewsLocked(profile, severity),
+                    gpuOffloadPlan = offloadPlan,
+                    deviceCapabilities = caps,
+                    thermalState = thermalState
+                )
+            }
+        }
+        if (thermalAuto && severity == ThermalSeverity.CRITICAL) {
+            triggerCriticalThermalRelease()
+        }
+    }
+
+    private fun triggerCriticalThermalRelease() {
+        if (emergencyThermalJob?.isActive == true) return
+        emergencyThermalJob = orchestratorScope.launch {
+            runCatching { resilientBackend.cancel() }
+            val hasLoadedResources = synchronized(configLock) { activeModelId != null } ||
+                resilientBackend.lifecycleState.value is EngineLifecycleState.Ready ||
+                resilientBackend.lifecycleState.value is EngineLifecycleState.Generating ||
+                resilientBackend.lifecycleState.value is EngineLifecycleState.LoadingModel
+            if (hasLoadedResources) {
+                runCatching { unloadModel() }
+            }
+            emergencyReleaseCount++
+            lastThermalEventNote = "CRITICAL thermal status: stopped active inference and released model memory."
+            val metrics = resourceManager.liveMetrics()
+            val caps = hardwareManager.getDeviceCapabilities()
+            _snapshot.update { current ->
+                current.copy(
+                    lifecycleState = resilientBackend.lifecycleState.value,
+                    liveMetrics = metrics,
+                    deviceCapabilities = caps,
+                    thermalState = buildThermalStateLocked(
+                        severity = metrics.thermalSeverity,
+                        caps = caps,
+                        metrics = metrics,
+                        fallbackThreads = 1
+                    )
                 )
             }
         }
@@ -717,6 +957,7 @@ class RuntimeOrchestrator(
 
     private fun recomputeSchedulingSnapshot() {
         val metrics = resourceManager.liveMetrics()
+        val caps = hardwareManager.getDeviceCapabilities()
         _snapshot.update { current ->
             val profile = current.hardwareProfile
             val probe = profile?.vulkanCapabilities ?: current.vulkanCapabilities
@@ -724,6 +965,7 @@ class RuntimeOrchestrator(
             val offloadPlan = computeOffloadPlanLocked(metrics, probe)
             val compatReport = computeCompatibilityReportLocked(npuProbe, probe)
             if (profile == null) {
+                val thermalState = buildThermalStateLocked(metrics.thermalSeverity, caps, metrics, current.recommendedThreads)
                 current.copy(
                     lifecycleState = resilientBackend.lifecycleState.value,
                     liveMetrics = metrics,
@@ -736,10 +978,12 @@ class RuntimeOrchestrator(
                     manualGpuLayers = manualGpuLayers,
                     npuCapabilities = npuProbe,
                     npuCompatibilityReport = compatReport,
-                    deviceCapabilities = hardwareManager.getDeviceCapabilities()
+                    deviceCapabilities = caps,
+                    thermalState = thermalState
                 )
             } else {
                 val decision = computeDecisionLocked(profile, metrics.thermalSeverity, lastWorkload)
+                val thermalState = buildThermalStateLocked(metrics.thermalSeverity, caps, metrics, decision.effectiveThreads)
                 current.copy(
                     lifecycleState = resilientBackend.lifecycleState.value,
                     versionInfo = resilientBackend.versionInfo,
@@ -758,10 +1002,28 @@ class RuntimeOrchestrator(
                     manualGpuLayers = manualGpuLayers,
                     npuCapabilities = npuProbe,
                     npuCompatibilityReport = compatReport,
-                    deviceCapabilities = hardwareManager.getDeviceCapabilities()
+                    deviceCapabilities = caps,
+                    thermalState = thermalState
                 )
             }
         }
+    }
+
+    private fun buildThermalStateLocked(
+        severity: ThermalSeverity,
+        caps: DeviceCapabilities?,
+        metrics: LiveDeviceMetrics?,
+        fallbackThreads: Int
+    ): ThermalRuntimeActionState = synchronized(configLock) {
+        ThermalGovernor.evaluate(
+            severity = severity,
+            deviceCapabilities = caps,
+            liveMetrics = metrics,
+            autoProtectionEnabled = autoThermalDownshift,
+            requestedThreads = manualThreadsOverride ?: fallbackThreads.coerceAtLeast(1),
+            emergencyReleaseCount = emergencyReleaseCount,
+            lastThermalEventNote = lastThermalEventNote
+        )
     }
 
     private fun computeCompatibilityReportLocked(
@@ -800,7 +1062,8 @@ class RuntimeOrchestrator(
             vulkanProbe = probe,
             preference = acceleratorPreference,
             autoOffload = autoGpuLayerOffload,
-            manualLayersOverride = manualGpuLayers
+            manualLayersOverride = manualGpuLayers,
+            thermalSeverity = if (autoThermalDownshift) metrics.thermalSeverity else ThermalSeverity.NOMINAL
         )
     }
 

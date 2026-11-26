@@ -1,6 +1,7 @@
 package com.quantchat.engine.core
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -19,7 +20,8 @@ class ResilientFailoverBackend(
         )
     },
     private val npuBackend: NpuInferenceBackend? = null,
-    private val capabilityProvider: HardwareCapabilityProvider? = null
+    private val capabilityProvider: HardwareCapabilityProvider? = null,
+    private val severeThermalPacingMs: Long = DeviceCapabilitiesPolicy.SEVERE_TOKEN_PACING_DELAY_MS
 ) : InferenceBackend {
 
     fun npuInferenceBackend(): NpuInferenceBackend? = npuBackend
@@ -88,7 +90,7 @@ class ResilientFailoverBackend(
     fun currentPreference(): AcceleratorPreference = preference
 
     fun activeBackendType(): AcceleratorBackendType =
-        if (activeBackend === primaryGpuBackend && primaryGpuBackend != null) {
+        if (primaryGpuBackend != null && activeBackend === primaryGpuBackend) {
             AcceleratorBackendType.VULKAN_GPU
         } else {
             AcceleratorBackendType.CPU
@@ -136,6 +138,13 @@ class ResilientFailoverBackend(
 
     override suspend fun loadModel(model: ModelConfig): EngineLifecycleState.Ready =
         routeMutex.withLock {
+            val preLoadCaps = capabilityProvider?.getDeviceCapabilities()
+            if (preLoadCaps?.isCriticalThermal == true) {
+                throw EngineError.ThermalShutdown(
+                    thermalStatus = preLoadCaps.thermalStatus,
+                    reason = "Device is in CRITICAL thermal state; model loading blocked to protect hardware."
+                )
+            }
             val pref = preference
             val totalLayers = model.totalLayers.coerceAtLeast(0)
 
@@ -284,6 +293,15 @@ class ResilientFailoverBackend(
     override fun generate(request: GenerationRequest): Flow<GenerationEvent> = channelFlow {
         val initialBackend = activeBackend
         val capSnapshot = capabilityProvider?.getDeviceCapabilities()
+        if (capSnapshot?.isCriticalThermal == true) {
+            _runtimeStatus.value = _runtimeStatus.value.copy(
+                statusSummary = "Thermal Critical · Stopped"
+            )
+            throw EngineError.ThermalShutdown(
+                thermalStatus = capSnapshot.thermalStatus,
+                reason = "Device reached CRITICAL thermal status — inference stopped and resources will be released."
+            )
+        }
         val effectiveRequest = if (capSnapshot != null) {
             DeviceCapabilitiesPolicy.applyThermalDownshift(request, capSnapshot)
         } else {
@@ -291,7 +309,11 @@ class ResilientFailoverBackend(
         }
         if (capSnapshot?.isThermallyThrottled == true) {
             val currentStatus = _runtimeStatus.value
-            val suffix = " · Thermal Guard (${effectiveRequest.threadsOverride ?: capSnapshot.cpuCores}T)"
+            val suffix = if (capSnapshot.isSevereThermal) {
+                " · Thermal Guard (${effectiveRequest.threadsOverride ?: capSnapshot.cpuCores}T · Paced)"
+            } else {
+                " · Thermal Guard (${effectiveRequest.threadsOverride ?: capSnapshot.cpuCores}T)"
+            }
             if (!currentStatus.statusSummary.contains("Thermal Guard")) {
                 _runtimeStatus.value = currentStatus.copy(
                     statusSummary = currentStatus.statusSummary + suffix
@@ -303,8 +325,22 @@ class ResilientFailoverBackend(
 
         try {
             initialBackend.generate(effectiveRequest).collect { event ->
+                val liveCaps = capabilityProvider?.getDeviceCapabilities()
+                if (liveCaps?.isCriticalThermal == true) {
+                    runCatching { initialBackend.cancel() }
+                    _runtimeStatus.value = _runtimeStatus.value.copy(
+                        statusSummary = "Thermal Critical · Stopped"
+                    )
+                    throw EngineError.ThermalShutdown(
+                        thermalStatus = liveCaps.thermalStatus,
+                        reason = "Thermal status escalated to CRITICAL mid-generation — stopped inference."
+                    )
+                }
                 if (event is GenerationEvent.TokenDelta) {
                     emittedAnyToken = true
+                    if (liveCaps?.isSevereThermal == true && severeThermalPacingMs > 0L) {
+                        delay(severeThermalPacingMs)
+                    }
                 }
                 if (event is GenerationEvent.Completed) {
                     generationSucceeded = true
@@ -312,6 +348,9 @@ class ResilientFailoverBackend(
                 _lifecycleState.value = initialBackend.lifecycleState.value
                 send(event)
             }
+        } catch (e: EngineError.ThermalShutdown) {
+            _lifecycleState.value = activeBackend.lifecycleState.value
+            throw e
         } catch (e: CancellationException) {
             _lifecycleState.value = activeBackend.lifecycleState.value
             throw e
@@ -328,7 +367,7 @@ class ResilientFailoverBackend(
             if (!emittedAnyToken && loadedModel != null) {
                 // Safe pre-decode failover: unload broken GPU context, load CPU context, retry seamlessly
                 val failoverReady = routeMutex.withLock {
-                    runCatching { primaryGpuBackend?.unload() }
+                    runCatching { primaryGpuBackend.unload() }
                     loadCpuOnlyLocked(
                         model = loadedModel.copy(gpuLayers = 0),
                         requestedPreference = preference,
@@ -347,7 +386,7 @@ class ResilientFailoverBackend(
             } else {
                 // Stream already started on GPU; clean up GPU and switch future turns to CPU
                 routeMutex.withLock {
-                    runCatching { primaryGpuBackend?.unload() }
+                    runCatching { primaryGpuBackend.unload() }
                     activeBackend = fallbackCpuBackend
                     if (loadedModel != null) {
                         runCatching { fallbackCpuBackend.loadModel(loadedModel.copy(gpuLayers = 0)) }

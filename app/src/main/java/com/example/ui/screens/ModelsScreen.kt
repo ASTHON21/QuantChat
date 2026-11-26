@@ -78,6 +78,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
+import com.example.ui.components.MemoryAdmissionBreakdownStrip
 import com.example.data.ActiveDownloadState
 import com.example.data.DownloadPhase
 import com.example.data.FileInspectionUiState
@@ -88,6 +89,10 @@ import com.example.data.HubSearchUiState
 import com.example.data.LocalRuntimeState
 import com.example.data.LocalWeightFile
 import com.example.data.ModelFileArtifact
+import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.Verified
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.minimumInteractiveComponentSize
 import com.example.ui.theme.QuantEmerald
 import com.example.ui.theme.QuantEmeraldContainer
 import com.example.ui.theme.QuantError
@@ -98,14 +103,20 @@ import com.example.ui.theme.QuantOnSurfaceVariant
 import com.example.ui.theme.QuantOutline
 import com.example.ui.theme.QuantOutlineVariant
 import com.example.ui.theme.QuantRose
+import com.example.ui.theme.QuantRoseContainer
 import com.example.ui.theme.QuantSurface
 import com.example.ui.theme.QuantSurfaceContainer
 import com.example.ui.theme.QuantSurfaceHigh
 import com.example.ui.theme.QuantSurfaceLow
 import com.example.ui.theme.QuantSurfaceLowest
 import com.example.ui.theme.QuantTextStyles
+import com.quantchat.engine.core.MmapLifecycleSnapshot
 import com.quantchat.engine.core.NpuCompatibilityReport
 import com.quantchat.engine.core.NpuProbeResult
+import com.quantchat.integration.BackgroundServicesStatus
+import com.quantchat.model.ModelIntegrityVerdict
+import com.quantchat.model.StorageSpaceChecker
+import com.quantchat.model.StorageSpaceSnapshot
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -124,6 +135,10 @@ fun ModelsScreen(
     isImportingLocalFile: Boolean,
     npuCapabilities: NpuProbeResult? = null,
     npuCompatibilityReport: NpuCompatibilityReport? = null,
+    backgroundServicesStatus: BackgroundServicesStatus? = null,
+    storageSnapshot: StorageSpaceSnapshot? = null,
+    mmapLifecycle: MmapLifecycleSnapshot? = null,
+    pendingDeleteConfirmation: LocalWeightFile? = null,
     onSelectTab: (HubModelTab) -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSearchHubClick: () -> Unit,
@@ -139,7 +154,10 @@ fun ModelsScreen(
     onOpenChatWithModel: () -> Unit,
     onImportLocalGgufUri: (Uri) -> Unit,
     onResumeLocalPartial: (LocalWeightFile) -> Unit,
+    onVerifyLocalFile: (LocalWeightFile) -> Unit = {},
     onDeleteLocalFile: (LocalWeightFile) -> Unit,
+    onConfirmUnloadAndDelete: (LocalWeightFile) -> Unit = {},
+    onDismissDeleteConfirmation: () -> Unit = {},
     onSaveHfToken: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -237,7 +255,9 @@ fun ModelsScreen(
             }
 
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("models_lazy_column"),
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
@@ -300,6 +320,7 @@ fun ModelsScreen(
                     item(key = "active_download_banner") {
                         ActiveDownloadBanner(
                             state = activeDownload,
+                            fgsActive = backgroundServicesStatus?.downloadService?.foregroundActive == true,
                             onPause = onPauseDownload,
                             onResume = onResumeDownload,
                             onCancel = onCancelDownload,
@@ -576,6 +597,15 @@ fun ModelsScreen(
                             }
                         }
 
+                        if (storageSnapshot != null || mmapLifecycle != null) {
+                            item(key = "storage_mmap_lifecycle_card") {
+                                DeviceStorageAndMmapCard(
+                                    storageSnapshot = storageSnapshot,
+                                    mmapLifecycle = mmapLifecycle
+                                )
+                            }
+                        }
+
                         if (localWeightFiles.isEmpty()) {
                             item(key = "downloaded_empty") {
                                 EmptyHubHint(
@@ -597,6 +627,7 @@ fun ModelsScreen(
                                     onUnload = onUnloadLocalModel,
                                     onOpenChat = onOpenChatWithModel,
                                     onResume = { onResumeLocalPartial(file) },
+                                    onVerify = { onVerifyLocalFile(file) },
                                     onDelete = { onDeleteLocalFile(file) }
                                 )
                             }
@@ -710,12 +741,22 @@ fun ModelsScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             items(fileInspectionState.files, key = { it.rfilename }) { artifact ->
+                                val requiredWithBuffer = if (artifact.sizeBytes > 0L) {
+                                    artifact.sizeBytes + StorageSpaceChecker.calculateSafetyBufferBytes(artifact.sizeBytes)
+                                } else 0L
+                                val insufficientSpace = storageSnapshot != null &&
+                                    requiredWithBuffer > 0L &&
+                                    storageSnapshot.availableBytes < requiredWithBuffer
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clip(RoundedCornerShape(6.dp))
                                         .background(QuantSurfaceLowest)
-                                        .border(1.dp, QuantSurfaceHigh, RoundedCornerShape(6.dp))
+                                        .border(
+                                            1.dp,
+                                            if (insufficientSpace) QuantRose.copy(alpha = 0.5f) else QuantSurfaceHigh,
+                                            RoundedCornerShape(6.dp)
+                                        )
                                         .clickable {
                                             onSelectArtifactToDownload(fileInspectionState.model, artifact)
                                         }
@@ -741,6 +782,16 @@ fun ModelsScreen(
                                                 style = QuantTextStyles.DataTabular,
                                                 color = QuantOnSurface
                                             )
+                                            if (insufficientSpace) {
+                                                Text(
+                                                    text = "LOW DISK",
+                                                    style = QuantTextStyles.LabelSm,
+                                                    color = QuantRose,
+                                                    modifier = Modifier
+                                                        .background(QuantRoseContainer.copy(alpha = 0.5f), RoundedCornerShape(3.dp))
+                                                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                                                )
+                                            }
                                         }
                                         Text(
                                             text = artifact.rfilename,
@@ -750,11 +801,19 @@ fun ModelsScreen(
                                             overflow = TextOverflow.Ellipsis,
                                             modifier = Modifier.padding(top = 4.dp)
                                         )
+                                        if (insufficientSpace) {
+                                            Text(
+                                                text = "Needs ~${formatBytes(requiredWithBuffer)} incl. safety buffer (${formatBytes(storageSnapshot.availableBytes)} free)",
+                                                style = QuantTextStyles.LabelSm,
+                                                color = QuantRose,
+                                                modifier = Modifier.padding(top = 2.dp)
+                                            )
+                                        }
                                     }
                                     Icon(
                                         imageVector = Icons.Filled.Download,
                                         contentDescription = "Download ${artifact.rfilename}",
-                                        tint = QuantEmerald,
+                                        tint = if (insufficientSpace) QuantRose else QuantEmerald,
                                         modifier = Modifier.size(20.dp)
                                     )
                                 }
@@ -777,11 +836,20 @@ fun ModelsScreen(
             }
         )
     }
+
+    if (pendingDeleteConfirmation != null) {
+        ActiveMmapDeleteConfirmDialog(
+            file = pendingDeleteConfirmation,
+            onDismiss = onDismissDeleteConfirmation,
+            onConfirmUnloadAndDelete = { onConfirmUnloadAndDelete(pendingDeleteConfirmation) }
+        )
+    }
 }
 
 @Composable
 private fun ActiveDownloadBanner(
     state: ActiveDownloadState,
+    fgsActive: Boolean = false,
     onPause: () -> Unit,
     onResume: () -> Unit,
     onCancel: () -> Unit,
@@ -813,10 +881,11 @@ private fun ActiveDownloadBanner(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                val transportTag = if (fgsActive) "OkHttp · FGS dataSync" else "OkHttp Streaming"
                 Text(
-                    text = "${state.repoId} · OkHttp Streaming",
+                    text = "${state.repoId} · $transportTag",
                     style = QuantTextStyles.LabelSm,
-                    color = QuantOutline
+                    color = if (fgsActive) QuantEmerald else QuantOutline
                 )
             }
 
@@ -861,7 +930,7 @@ private fun ActiveDownloadBanner(
                 )
                 val statusRight = when (state.phase) {
                     DownloadPhase.COMPLETED -> "SAVED TO APP STORAGE"
-                    DownloadPhase.PAUSED -> "PAUSED (RANGE READY)"
+                    DownloadPhase.PAUSED -> if (state.pausedByThermal) "PAUSED (THERMAL GUARD)" else "PAUSED (RANGE READY)"
                     else -> "${formatSpeed(state.speedBytesPerSec)} · ETA ${state.etaSeconds}s"
                 }
                 Text(
@@ -1025,6 +1094,185 @@ private fun HubModelCard(
 }
 
 @Composable
+private fun DeviceStorageAndMmapCard(
+    storageSnapshot: StorageSpaceSnapshot?,
+    mmapLifecycle: MmapLifecycleSnapshot?
+) {
+    val lowStorage = storageSnapshot?.isLowStorage == true
+    val activeLeases = mmapLifecycle?.totalActiveMappings ?: 0
+    val borderColor = when {
+        lowStorage -> QuantRose.copy(alpha = 0.55f)
+        activeLeases > 0 -> QuantEmerald.copy(alpha = 0.45f)
+        else -> QuantSurfaceHigh
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .background(QuantSurfaceLowest)
+            .border(1.dp, borderColor, RoundedCornerShape(6.dp))
+            .padding(12.dp)
+            .testTag("storage_mmap_lifecycle_card"),
+        verticalArrangement = Arrangement.spacedBy(7.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Shield,
+                    contentDescription = null,
+                    tint = if (lowStorage) QuantRose else QuantEmerald,
+                    modifier = Modifier.size(15.dp)
+                )
+                Text(
+                    text = "STORAGE & MMAP LIFECYCLE",
+                    style = QuantTextStyles.LabelSm,
+                    color = if (lowStorage) QuantRose else QuantEmerald
+                )
+            }
+            Text(
+                text = "$activeLeases active mmap${if (activeLeases == 1) "" else "s"}",
+                style = QuantTextStyles.DataTabular,
+                color = if (activeLeases > 0) QuantEmerald else QuantOutline
+            )
+        }
+
+        if (storageSnapshot != null) {
+            val usedBytes = (storageSnapshot.totalBytes - storageSnapshot.availableBytes).coerceAtLeast(0L)
+            val usedFraction = if (storageSnapshot.totalBytes > 0L) {
+                (usedBytes.toFloat() / storageSnapshot.totalBytes.toFloat()).coerceIn(0f, 1f)
+            } else 0f
+
+            LinearProgressIndicator(
+                progress = { usedFraction },
+                color = if (lowStorage) QuantRose else QuantEmerald,
+                trackColor = QuantSurfaceContainer,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(5.dp)
+                    .clip(RoundedCornerShape(99.dp))
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "${formatBytes(storageSnapshot.availableBytes)} free / ${formatBytes(storageSnapshot.totalBytes)}",
+                    style = QuantTextStyles.LabelSm,
+                    color = if (lowStorage) QuantRose else QuantOnSurface
+                )
+                Text(
+                    text = "GGUF ${formatBytes(storageSnapshot.modelsUsedBytes)} · Part ${formatBytes(storageSnapshot.partialUsedBytes)}",
+                    style = QuantTextStyles.DataTabular,
+                    color = QuantOutline
+                )
+            }
+            if (lowStorage) {
+                Text(
+                    text = "Low storage (<1 GB free): new downloads keep a 256 MB / 5% safety buffer.",
+                    style = QuantTextStyles.LabelSm,
+                    color = QuantRose
+                )
+            }
+        }
+
+        if (mmapLifecycle != null) {
+            val activeSummary = if (mmapLifecycle.activeLeases.isNotEmpty()) {
+                mmapLifecycle.activeLeases.joinToString(" · ") { lease ->
+                    val lockTag = if (lease.sharedFileLockHeld) "FileLock" else "Lease"
+                    "${lease.fileName} (${lease.backendId}, $lockTag)"
+                }
+            } else {
+                "No open mmap / PFD file leases (safe to modify or delete)"
+            }
+            Text(
+                text = activeSummary,
+                style = QuantTextStyles.LabelSm,
+                color = if (mmapLifecycle.activeLeases.isNotEmpty()) QuantEmerald else QuantOutline,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            mmapLifecycle.lastBlockedDeleteReason?.let { blocked ->
+                Text(
+                    text = blocked,
+                    style = QuantTextStyles.LabelSm,
+                    color = QuantRose,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActiveMmapDeleteConfirmDialog(
+    file: LocalWeightFile,
+    onDismiss: () -> Unit,
+    onConfirmUnloadAndDelete: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = QuantSurfaceLow,
+        titleContentColor = QuantOnSurface,
+        textContentColor = QuantOnSurfaceVariant,
+        modifier = Modifier.testTag("confirm_unmap_delete_dialog"),
+        icon = {
+            Icon(
+                imageVector = Icons.Filled.Warning,
+                contentDescription = null,
+                tint = QuantRose
+            )
+        },
+        title = {
+            Text(
+                text = "Release Active mmap Mapping?",
+                style = QuantTextStyles.HeadlineMd
+            )
+        },
+        text = {
+            Text(
+                text = "\"${file.displayFileName}\" currently holds an active ParcelFileDescriptor + mmap FileLock lease in memory. Stop inference, release the mapping, and delete the file?",
+                style = QuantTextStyles.BodySm,
+                color = QuantOnSurfaceVariant
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirmUnloadAndDelete,
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .testTag("confirm_unmap_delete_button"),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = QuantRoseContainer,
+                    contentColor = QuantRose
+                )
+            ) {
+                Text("Unload & Delete", style = QuantTextStyles.LabelMd.copy(fontWeight = FontWeight.SemiBold))
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .testTag("cancel_unmap_delete_button")
+            ) {
+                Text("Cancel", style = QuantTextStyles.LabelMd, color = QuantOutline)
+            }
+        }
+    )
+}
+
+@Composable
 private fun LocalWeightCard(
     file: LocalWeightFile,
     isLoaded: Boolean,
@@ -1035,8 +1283,10 @@ private fun LocalWeightCard(
     onUnload: () -> Unit,
     onOpenChat: () -> Unit,
     onResume: () -> Unit,
+    onVerify: () -> Unit,
     onDelete: () -> Unit
 ) {
+    val isMappedOrLoaded = isLoaded || file.hasActiveMmapLease
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1044,7 +1294,7 @@ private fun LocalWeightCard(
             .background(QuantSurfaceLowest)
             .border(
                 1.dp,
-                if (isLoaded) QuantEmerald.copy(alpha = 0.6f) else QuantSurfaceHigh,
+                if (isMappedOrLoaded) QuantEmerald.copy(alpha = 0.6f) else QuantSurfaceHigh,
                 RoundedCornerShape(6.dp)
             )
             .padding(14.dp),
@@ -1061,11 +1311,11 @@ private fun LocalWeightCard(
                 modifier = Modifier.weight(1f)
             ) {
                 Icon(
-                    imageVector = if (isLoaded) Icons.Filled.CheckCircle else Icons.Filled.Storage,
+                    imageVector = if (isMappedOrLoaded) Icons.Filled.CheckCircle else Icons.Filled.Storage,
                     contentDescription = null,
                     tint = when {
                         file.isPartial -> QuantOutline
-                        isLoaded -> QuantEmerald
+                        isMappedOrLoaded -> QuantEmerald
                         else -> QuantOnSurfaceVariant
                     },
                     modifier = Modifier.size(19.dp)
@@ -1083,16 +1333,100 @@ private fun LocalWeightCard(
                             when {
                                 file.isPartial -> " (Partial)"
                                 isLoaded -> " (Loaded in RAM)"
+                                file.hasActiveMmapLease -> " (mmap Active)"
                                 else -> " (Ready)"
                             },
                         style = QuantTextStyles.LabelSm,
                         color = when {
                             file.isPartial -> QuantRose
-                            isLoaded -> QuantEmerald
+                            isMappedOrLoaded -> QuantEmerald
                             else -> QuantOutline
                         }
                     )
-                    if (!file.isPartial) {
+                    if (file.isPartial) {
+                        val expected = file.expectedTotalBytes ?: 0L
+                        if (expected > 0L) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            LinearProgressIndicator(
+                                progress = { file.partialProgressFraction ?: 0f },
+                                color = QuantEmerald,
+                                trackColor = QuantSurfaceContainer,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(4.dp)
+                                    .clip(RoundedCornerShape(99.dp))
+                            )
+                            Text(
+                                text = "Checkpoint: ${formatBytes(file.sizeBytes)} / ${formatBytes(expected)} (${file.partialProgressPercent ?: 0}%) · Range resume ready",
+                                style = QuantTextStyles.LabelSm,
+                                color = QuantOnSurfaceVariant,
+                                modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier.padding(top = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val verified = file.verifiedManifest
+                            val badgeLabel = when (verified?.verdict) {
+                                ModelIntegrityVerdict.VERIFIED_SHA256 -> "SHA-256 Verified"
+                                ModelIntegrityVerdict.VERIFIED_GGUF -> "GGUF Verified"
+                                null -> "Unverified"
+                                else -> verified.verdict.label
+                            }
+                            val badgeValid = verified?.verdict == ModelIntegrityVerdict.VERIFIED_SHA256 ||
+                                verified?.verdict == ModelIntegrityVerdict.VERIFIED_GGUF
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(
+                                        (if (badgeValid) QuantEmerald else QuantSurfaceContainer)
+                                            .copy(alpha = if (badgeValid) 0.14f else 1f)
+                                    )
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    .testTag("local_weight_verify_badge_${file.diskFileName}"),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Verified,
+                                    contentDescription = null,
+                                    tint = if (badgeValid) QuantEmerald else QuantOutline,
+                                    modifier = Modifier.size(11.dp)
+                                )
+                                Text(
+                                    text = badgeLabel,
+                                    style = QuantTextStyles.LabelSm,
+                                    color = if (badgeValid) QuantEmerald else QuantOutline
+                                )
+                            }
+
+                            if (isMappedOrLoaded) {
+                                Row(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(QuantEmerald.copy(alpha = 0.14f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        .testTag("local_weight_mmap_badge_${file.diskFileName}"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Lock,
+                                        contentDescription = null,
+                                        tint = QuantEmerald,
+                                        modifier = Modifier.size(11.dp)
+                                    )
+                                    Text(
+                                        text = "mmap + FileLock",
+                                        style = QuantTextStyles.LabelSm,
+                                        color = QuantEmerald
+                                    )
+                                }
+                            }
+                        }
                         val metaParts = buildList {
                             file.headerMetadata?.architecture?.let { add("arch: $it") }
                             file.headerMetadata?.declaredContextLength?.let { add("maxCtx: $it") }
@@ -1127,6 +1461,12 @@ private fun LocalWeightCard(
                                     .testTag("local_weight_npu_gate_${file.diskFileName}")
                             )
                         }
+                        file.admission?.let { admission ->
+                            MemoryAdmissionBreakdownStrip(
+                                assessment = admission,
+                                modifier = Modifier.padding(top = 6.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -1134,13 +1474,13 @@ private fun LocalWeightCard(
             IconButton(
                 onClick = onDelete,
                 modifier = Modifier
-                    .size(40.dp)
+                    .minimumInteractiveComponentSize()
                     .testTag("delete_weight_${file.diskFileName}")
             ) {
                 Icon(
                     imageVector = Icons.Filled.DeleteOutline,
                     contentDescription = "Delete file",
-                    tint = QuantOutline
+                    tint = if (isMappedOrLoaded) QuantRose else QuantOutline
                 )
             }
         }
@@ -1149,7 +1489,10 @@ private fun LocalWeightCard(
             if (file.downloadUrl != null) {
                 Button(
                     onClick = onResume,
-                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("resume_partial_${file.diskFileName}"),
                     shape = RoundedCornerShape(4.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = QuantSurfaceContainer,
@@ -1171,7 +1514,7 @@ private fun LocalWeightCard(
                         Row(
                             modifier = Modifier
                                 .weight(1f)
-                                .height(40.dp)
+                                .height(48.dp)
                                 .clip(RoundedCornerShape(4.dp))
                                 .background(QuantSurfaceContainer),
                             horizontalArrangement = Arrangement.Center,
@@ -1191,7 +1534,7 @@ private fun LocalWeightCard(
                             onClick = onOpenChat,
                             modifier = Modifier
                                 .weight(1f)
-                                .height(40.dp)
+                                .height(48.dp)
                                 .testTag("open_chat_loaded_${file.diskFileName}"),
                             shape = RoundedCornerShape(4.dp),
                             colors = ButtonDefaults.buttonColors(
@@ -1203,7 +1546,9 @@ private fun LocalWeightCard(
                         }
                         OutlinedButton(
                             onClick = onUnload,
-                            modifier = Modifier.height(40.dp),
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("unload_weight_${file.diskFileName}"),
                             shape = RoundedCornerShape(4.dp)
                         ) {
                             Text("Unload", style = QuantTextStyles.LabelSm, color = QuantRose)
@@ -1213,8 +1558,8 @@ private fun LocalWeightCard(
                         Button(
                             onClick = onLoad,
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .height(40.dp)
+                                .weight(1f)
+                                .height(48.dp)
                                 .testTag("load_weight_${file.diskFileName}"),
                             shape = RoundedCornerShape(4.dp),
                             colors = ButtonDefaults.buttonColors(
@@ -1223,6 +1568,15 @@ private fun LocalWeightCard(
                             )
                         ) {
                             Text("Load into Offline Runtime", style = QuantTextStyles.LabelSm.copy(fontWeight = FontWeight.SemiBold))
+                        }
+                        OutlinedButton(
+                            onClick = onVerify,
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("verify_weight_${file.diskFileName}"),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text("Verify", style = QuantTextStyles.LabelSm, color = QuantEmerald)
                         }
                     }
                 }

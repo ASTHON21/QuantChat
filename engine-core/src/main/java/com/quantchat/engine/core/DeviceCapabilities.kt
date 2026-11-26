@@ -22,6 +22,9 @@ data class DeviceCapabilities(
     val isSevereThermal: Boolean
         get() = thermalStatus >= THERMAL_STATUS_SEVERE
 
+    val isCriticalThermal: Boolean
+        get() = thermalStatus >= THERMAL_STATUS_CRITICAL
+
     companion object {
         const val GPU_BACKEND_VULKAN = "VULKAN"
         const val GPU_BACKEND_OPENCL = "OPENCL"
@@ -35,6 +38,25 @@ data class DeviceCapabilities(
     }
 }
 
+enum class ThermalInferenceAction(val title: String, val behaviorLabel: String) {
+    NORMAL("Normal", "Normal inference"),
+    REDUCE_THREADS_AND_GPU("Throttle Load", "Reduce threads or GPU load"),
+    THROTTLE_SPEED_AND_PAUSE_NON_ESSENTIAL("Severe Guard", "Reduce generation speed · pause non-essential tasks"),
+    STOP_AND_RELEASE("Critical Stop", "Stop inference & safely release resources")
+}
+
+data class ThermalPolicyDecision(
+    val thermalStatus: Int,
+    val action: ThermalInferenceAction,
+    val maxCpuThreads: Int,
+    val gpuLoadScaleFactor: Float,
+    val allowGpuOffload: Boolean,
+    val tokenPacingDelayMs: Long,
+    val pauseNonEssentialTasks: Boolean,
+    val stopInferenceAndRelease: Boolean,
+    val summary: String
+)
+
 interface HardwareCapabilityProvider {
     val deviceCapabilities: StateFlow<DeviceCapabilities>
     fun getDeviceCapabilities(): DeviceCapabilities
@@ -47,6 +69,61 @@ data class CapabilityBackendGateResult(
 
 object DeviceCapabilitiesPolicy {
     private const val MIN_GPU_SAFE_MEMORY_BYTES = 384L * 1024L * 1024L
+    const val SEVERE_TOKEN_PACING_DELAY_MS = 35L
+
+    fun evaluateThermalPolicy(
+        capabilities: DeviceCapabilities,
+        requestedThreads: Int = capabilities.cpuCores
+    ): ThermalPolicyDecision {
+        val cores = capabilities.cpuCores.coerceAtLeast(1)
+        val safeRequested = requestedThreads.coerceIn(1, cores)
+        return when {
+            capabilities.isCriticalThermal -> ThermalPolicyDecision(
+                thermalStatus = capabilities.thermalStatus,
+                action = ThermalInferenceAction.STOP_AND_RELEASE,
+                maxCpuThreads = 1,
+                gpuLoadScaleFactor = 0f,
+                allowGpuOffload = false,
+                tokenPacingDelayMs = 0L,
+                pauseNonEssentialTasks = true,
+                stopInferenceAndRelease = true,
+                summary = "CRITICAL thermal status: stopping active inference and releasing model resources."
+            )
+            capabilities.isSevereThermal -> ThermalPolicyDecision(
+                thermalStatus = capabilities.thermalStatus,
+                action = ThermalInferenceAction.THROTTLE_SPEED_AND_PAUSE_NON_ESSENTIAL,
+                maxCpuThreads = minOf(safeRequested, minOf(2, cores)).coerceAtLeast(1),
+                gpuLoadScaleFactor = 0f,
+                allowGpuOffload = false,
+                tokenPacingDelayMs = SEVERE_TOKEN_PACING_DELAY_MS,
+                pauseNonEssentialTasks = true,
+                stopInferenceAndRelease = false,
+                summary = "SEVERE thermal status: throttling token speed (${SEVERE_TOKEN_PACING_DELAY_MS}ms pacing), 0 GPU layers, pausing downloads/benchmarks."
+            )
+            capabilities.isThermallyThrottled -> ThermalPolicyDecision(
+                thermalStatus = capabilities.thermalStatus,
+                action = ThermalInferenceAction.REDUCE_THREADS_AND_GPU,
+                maxCpuThreads = minOf(safeRequested, maxOf(2, cores / 2).coerceAtMost(cores)).coerceAtLeast(1),
+                gpuLoadScaleFactor = 0.5f,
+                allowGpuOffload = true,
+                tokenPacingDelayMs = 0L,
+                pauseNonEssentialTasks = false,
+                stopInferenceAndRelease = false,
+                summary = "MODERATE thermal status: reducing CPU threads & halving GPU offload layers."
+            )
+            else -> ThermalPolicyDecision(
+                thermalStatus = capabilities.thermalStatus,
+                action = ThermalInferenceAction.NORMAL,
+                maxCpuThreads = safeRequested,
+                gpuLoadScaleFactor = 1.0f,
+                allowGpuOffload = true,
+                tokenPacingDelayMs = 0L,
+                pauseNonEssentialTasks = false,
+                stopInferenceAndRelease = false,
+                summary = "NONE/LIGHT thermal status: normal inference."
+            )
+        }
+    }
 
     fun evaluateGpuEligibility(
         capabilities: DeviceCapabilities,

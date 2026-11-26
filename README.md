@@ -1,23 +1,18 @@
 # QuantChat
 
-A 100% offline Android GGUF local AI chat application built with Kotlin, Jetpack Compose, Material 3, Room, and bundled `llama.cpp` JNI/NDK inference.
+A 100% offline Android GGUF local AI chat application built with Kotlin, Jetpack Compose, Material 3, Room, and modular native `llama.cpp` (CPU + Vulkan GPU) runtime orchestration.
 
-- **Zero Cloud / Zero Firebase Backend**: All conversations, downloaded weights, and inference run locally on-device. No telemetry, analytics, or remote backend keys are compiled into the app.
-- **On-Device GGUF Engine**: Uses `llamacpp-kotlin` (`org.nehuatl.llamacpp.LlamaAndroid`) for streaming token generation, stop-generation control, context size / thread / temperature tuning, and automatic chat-template formatting (`Qwen3.5`, `Qwen3`, `Gemma 3`, `Phi-4`).
-- **Model Management**:
-  - Pre-configured official 3.8B–4B models (`Qwen3.5-4B`, `Qwen3-4B`, `Gemma-3-4B`, `Phi-4-mini-3.8B`).
-  - On-demand Hugging Face Hub GGUF model search (network permission checked only when you trigger a search) and resumable/cancellable streaming downloads via OkHttp.
-  - Zero-permission Android Storage Access Framework (SAF) import for existing `.gguf` files on your device (with `GGUF` magic header validation).
-- **Local Persistence**: Conversations and messages stored locally in Room (`AppChatDatabase`); inference parameters stored in Jetpack DataStore.
-
-## Project Structure
-
-- `app/src/main/java/com/example/data/LocalLlamaRepository.kt` — `llama.cpp` native engine lifecycle & streaming token inference
-- `app/src/main/java/com/example/data/HuggingFaceModelRepository.kt` — HF Hub search, streaming GGUF download, SAF `.gguf` import, DataStore settings
-- `app/src/main/java/com/example/data/local/ChatDatabase.kt` — Room database (`ChatThreadEntity`, `ChatMessageEntity`, `ChatRepository`)
-- `app/src/main/java/com/example/ui/viewmodel/QuantTerminalViewModel.kt` — StateFlow state management across Chats & Models
-- `app/src/main/java/com/example/ui/screens/` — `ChatsScreen.kt`, `ChatDetailScreen.kt`, `ModelsScreen.kt`
-- `.github/workflows/build-apk.yml` — Automated CI/CD test + APK build + GitHub Release publishing
+- **Zero Cloud / Zero Firebase Backend**: All conversations, downloaded weights, KV-cache snapshots, and inference run locally on-device.
+- **Modular Multi-Engine Runtime**:
+  - `engine-core`: Unified `InferenceBackend`, `ResilientFailoverBackend` (GPU → CPU failover + thermal pacing), `NpuInferenceBackend` abstraction, `DeviceCapabilities` & `DeviceCapabilitiesPolicy`, and `MmapLifecycleRegistry` (`FileChannel` `FileLock` + PFD/`mmap` lease tracking).
+  - `engine-llamacpp`: Native `llamacpp-kotlin` CPU inference, streaming token generation, KV-cache session save/restore, and benchmarking.
+  - `engine-vulkan`: Modular C++17 JNI `ggml-vulkan` GPU acceleration and live buffer/FP16 probing.
+  - `hardware-manager`: Sysfs Prime/Big/LITTLE CPU cluster probing, NPU/Hexagon/APU/NNAPI capability detection, `ProcessMemoryProbe`, and `PowerManager` 4-tier thermal monitoring + headroom forecasting.
+  - `resource-manager`: Adaptive 4-mode CPU scheduler, `GpuOffloadPlanner`, 5-term `MemoryAdmissionPlanner`, and `ThermalGovernor` coordinated via `RuntimeOrchestrator`.
+  - `model-manager` & `session-manager`: Binary GGUF header metadata parser (`GgufHeaderParser`), `ModelFileVerifier` (GGUF + SHA-256), `StorageSpaceChecker` (`StatFs`), `ModelFileLifecycleManager` (active-mmap safe delete), `.part.checkpoint.json` resume manifests, `n_ctx` token budgeter, and thread KV-cache persistence/pruning.
+  - `system-integration`: `ModelDownloadService` (`dataSync` FGS), `InferenceForegroundService` (`specialUse` FGS), `ModelMaintenanceWorker` (`WorkManager`), notification channels, and Share/Process-Text intent routing.
+  - `local-server`: Loopback OpenAI-compatible router (`LocalOpenAiRouter` / `LocalHttpServer`).
+- **Application-Scoped Decoupling (`QuantRuntimeHost`)**: Long-running model downloads and streaming inference survive Activity rotation and backgrounding via Foreground Services, while deferrable GGUF verification, expired `.part` cleanup, and orphan KV-cache pruning run via `WorkManager`.
 
 ## Automated APK Builds & Releases (GitHub Actions)
 
@@ -25,15 +20,7 @@ App versioning is managed centrally in `version.properties` (`VERSION_NAME`, `VE
 
 1. Runs JVM/Robolectric unit tests (`gradle :app:testDebugUnitTest`).
 2. Builds `QuantChat-v<VERSION_NAME>-debug.apk` (and `QuantChat-v<VERSION_NAME>-release.apk` if signing secrets exist) with `SHA256SUMS.txt`.
-3. Publishes a formal versioned **GitHub Release** (`v<VERSION_NAME>`, `prerelease: false`, marked as Latest) with notes extracted from `CHANGELOG.md`, build metadata, and commit history.
-
-### Optional: Signed Release APKs
-
-To also build a `QuantChat-release.apk` in CI, add the following repository secrets in **GitHub → Settings → Secrets and variables → Actions**:
-
-- `ANDROID_KEYSTORE_BASE64`: Base64-encoded `.jks` upload keystore (with key alias `upload`)
-- `STORE_PASSWORD`: Keystore password
-- `KEY_PASSWORD`: Key password
+3. Publishes a formal versioned **GitHub Release** (`v<VERSION_NAME>`, `prerelease: false`, marked as Latest).
 
 ## Local Development
 

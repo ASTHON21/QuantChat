@@ -19,6 +19,8 @@ import com.quantchat.engine.core.GenerationEvent
 import com.quantchat.engine.core.GenerationRequest
 import com.quantchat.engine.core.InferenceBackend
 import com.quantchat.engine.core.InferenceThreadPriority
+import com.quantchat.engine.core.MmapLeaseHandle
+import com.quantchat.engine.core.MmapLifecycleRegistry
 import com.quantchat.engine.core.ModelConfig
 import com.quantchat.engine.core.ModelId
 import com.quantchat.engine.core.PromptTemplateFormatter
@@ -95,6 +97,9 @@ class LlamaCppBackend(
     private var activeTokenSink: ((String) -> Unit)? = null
 
     @Volatile
+    private var activeMmapLease: MmapLeaseHandle? = null
+
+    @Volatile
     private var stopRequested: Boolean = false
 
     override suspend fun initialize(config: EngineConfig) {
@@ -140,9 +145,25 @@ class LlamaCppBackend(
                     throw err
                 }
 
+                val effectiveMmap = model.useMmap && engineConfig.enableMmap
+                val lease = try {
+                    MmapLifecycleRegistry.acquireReadMapping(
+                        file = diskFile,
+                        modelId = model.modelId.value,
+                        backendId = versionInfo.backendId,
+                        useMmap = effectiveMmap
+                    )
+                } catch (e: EngineError) {
+                    _lifecycleState.value = EngineLifecycleState.Faulted(model.modelId, e)
+                    throw e
+                }
+
                 val pfd = try {
-                    ParcelFileDescriptor.open(diskFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                    ParcelFileDescriptor.open(diskFile, ParcelFileDescriptor.MODE_READ_ONLY).also {
+                        MmapLifecycleRegistry.attachPfd(lease, it)
+                    }
                 } catch (e: Exception) {
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     val err = EngineError.BackendInitFailed(
                         "Unable to open read-only file descriptor for ${model.displayName}.",
                         e
@@ -151,6 +172,7 @@ class LlamaCppBackend(
                     throw err
                 }
                 val fd = pfd.detachFd()
+                MmapLifecycleRegistry.markPfdDetachedToNative(lease)
 
                 val engineParams = mapOf<String, Any>(
                     "model" to model.fileUri,
@@ -159,7 +181,7 @@ class LlamaCppBackend(
                     "n_batch" to model.batchSize,
                     "n_threads" to model.threads,
                     "n_gpu_layers" to 0,
-                    "use_mmap" to (model.useMmap && engineConfig.enableMmap),
+                    "use_mmap" to effectiveMmap,
                     "use_mlock" to (model.useMlock || engineConfig.enableMlock),
                     "embedding" to model.enableEmbedding
                 )
@@ -170,10 +192,12 @@ class LlamaCppBackend(
                     }
                 } catch (e: CancellationException) {
                     runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     _lifecycleState.value = EngineLifecycleState.Initialized(versionInfo, capabilities)
                     throw e
                 } catch (e: Exception) {
                     runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     val err = EngineError.BackendInitFailed(
                         e.localizedMessage ?: "Native llama.cpp startEngine threw an error.",
                         e
@@ -184,6 +208,7 @@ class LlamaCppBackend(
 
                 if (result == null) {
                     runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     val err = EngineError.BackendInitFailed(
                         "Native llama.cpp failed to initialize ${model.displayName}. Verify available RAM and 64-bit ABI support."
                     )
@@ -192,6 +217,7 @@ class LlamaCppBackend(
                 }
 
                 val ctxId = (result["contextId"] as? Number)?.toInt() ?: run {
+                    MmapLifecycleRegistry.releaseMapping(lease)
                     val err = EngineError.BackendInitFailed("Native engine returned an invalid context ID.")
                     _lifecycleState.value = EngineLifecycleState.Faulted(model.modelId, err)
                     throw err
@@ -202,6 +228,7 @@ class LlamaCppBackend(
                 activeModelConfig = model
                 activeModelDetails = details
                 activeSessionId = null
+                activeMmapLease = lease
 
                 val ready = EngineLifecycleState.Ready(
                     modelId = model.modelId,
@@ -211,7 +238,7 @@ class LlamaCppBackend(
                     modelDetails = details
                 )
                 _lifecycleState.value = ready
-                Log.d(TAG, "Loaded ${model.displayName} ctx=$ctxId n_ctx=${model.contextSize} T=${model.threads}")
+                Log.d(TAG, "Loaded ${model.displayName} ctx=$ctxId n_ctx=${model.contextSize} T=${model.threads} mmap=$effectiveMmap")
                 ready
             }
         }
@@ -616,7 +643,8 @@ class LlamaCppBackend(
     private suspend fun unloadLocked() {
         val prevModel = activeModelConfig?.modelId
         val ctxId = activeContextId
-        if (ctxId != null) {
+        val leaseToRelease = activeMmapLease
+        if (ctxId != null || leaseToRelease != null) {
             _lifecycleState.value = EngineLifecycleState.Unloading(prevModel)
         }
         activeContextId = null
@@ -624,12 +652,15 @@ class LlamaCppBackend(
         activeModelDetails = null
         activeSessionId = null
         activeTokenSink = null
+        activeMmapLease = null
         if (ctxId != null) {
             runCatching {
                 llama.stopCompletion(ctxId)
                 llama.releaseContext(ctxId)
             }.onFailure { Log.w(TAG, "releaseContext warning", it) }
         }
+        // Release tracked mmap lease & shared FileLock before completing unload
+        MmapLifecycleRegistry.releaseMapping(leaseToRelease)
         _lifecycleState.value = EngineLifecycleState.Initialized(versionInfo, capabilities)
     }
 

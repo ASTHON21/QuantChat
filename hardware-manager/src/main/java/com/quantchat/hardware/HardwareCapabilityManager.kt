@@ -20,13 +20,17 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
-enum class ThermalSeverity(val label: String, val statusCode: Int) {
-    NOMINAL("Nominal", DeviceCapabilities.THERMAL_STATUS_NOMINAL),
-    LIGHT("Light", DeviceCapabilities.THERMAL_STATUS_LIGHT),
-    MODERATE("Moderate", DeviceCapabilities.THERMAL_STATUS_MODERATE),
-    SEVERE("Severe", DeviceCapabilities.THERMAL_STATUS_SEVERE),
-    CRITICAL("Critical", DeviceCapabilities.THERMAL_STATUS_CRITICAL),
-    UNAVAILABLE("Unknown", DeviceCapabilities.THERMAL_STATUS_UNKNOWN)
+enum class ThermalSeverity(
+    val label: String,
+    val statusCode: Int,
+    val recommendedBehaviorSummary: String
+) {
+    NOMINAL("Nominal", DeviceCapabilities.THERMAL_STATUS_NOMINAL, "Normal inference"),
+    LIGHT("Light", DeviceCapabilities.THERMAL_STATUS_LIGHT, "Normal inference"),
+    MODERATE("Moderate", DeviceCapabilities.THERMAL_STATUS_MODERATE, "Reduce threads or GPU load"),
+    SEVERE("Severe", DeviceCapabilities.THERMAL_STATUS_SEVERE, "Throttle speed · pause non-essential tasks"),
+    CRITICAL("Critical", DeviceCapabilities.THERMAL_STATUS_CRITICAL, "Stop inference & release resources"),
+    UNAVAILABLE("Unknown", DeviceCapabilities.THERMAL_STATUS_UNKNOWN, "Thermal API unavailable")
 }
 
 data class CpuClusterSummary(
@@ -56,7 +60,9 @@ data class LiveDeviceMetrics(
     val availableRamMb: Long,
     val lowMemory: Boolean,
     val thermalSeverity: ThermalSeverity,
-    val availableMemoryBytes: Long = availableRamMb * 1024L * 1024L
+    val availableMemoryBytes: Long = availableRamMb * 1024L * 1024L,
+    val processMemory: ProcessMemoryTelemetry? = null,
+    val thermalHeadroomForecast: Float? = null
 )
 
 data class DeviceHardwareProfile(
@@ -83,7 +89,8 @@ data class DeviceHardwareProfile(
 class HardwareCapabilityManager(
     private val context: Context,
     private val vulkanNativeProbe: (suspend () -> VulkanProbeResult)? = null,
-    private val npuNativeProbe: (suspend () -> NpuNativeRuntimeProbe)? = null
+    private val npuNativeProbe: (suspend () -> NpuNativeRuntimeProbe)? = null,
+    private val processMemorySampler: ((ActivityManager?, ActivityManager.MemoryInfo) -> ProcessMemoryTelemetry)? = null
 ) : HardwareCapabilityProvider {
 
     private val capabilityLock = Any()
@@ -99,6 +106,10 @@ class HardwareCapabilityManager(
 
     @Volatile
     private var cachedNpuAvailable: Boolean = false
+
+    private val thermalStateLock = Any()
+    private var lastPolledPlatformThermal: ThermalSeverity = readPlatformThermalStatusRaw()
+    private var activeThermalOverride: ThermalSeverity? = null
 
     private val _thermalSeverityFlow = MutableStateFlow(readCurrentThermalStatus())
     val thermalSeverityFlow: StateFlow<ThermalSeverity> = _thermalSeverityFlow.asStateFlow()
@@ -116,7 +127,10 @@ class HardwareCapabilityManager(
     }
 
     fun startThermalMonitoring() {
-        val initialThermal = readCurrentThermalStatus()
+        val initialThermal = synchronized(thermalStateLock) {
+            activeThermalOverride = null
+            readPlatformThermalStatusRaw().also { lastPolledPlatformThermal = it }
+        }
         _thermalSeverityFlow.value = initialThermal
         publishDeviceCapabilities(readMemoryAndThermalRaw(overrideThermal = initialThermal))
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
@@ -124,9 +138,7 @@ class HardwareCapabilityManager(
             if (registeredThermalListener != null) return
             val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
             val listener = PowerManager.OnThermalStatusChangedListener { status ->
-                val mapped = mapPowerThermalStatus(status)
-                _thermalSeverityFlow.value = mapped
-                publishDeviceCapabilities(readMemoryAndThermalRaw(overrideThermal = mapped))
+                onPlatformThermalStatusChanged(status)
             }
             val registered = runCatching {
                 pm.addThermalStatusListener(context.mainExecutor, listener)
@@ -153,6 +165,17 @@ class HardwareCapabilityManager(
             }
             registeredThermalListener = null
         }
+    }
+
+    fun onPlatformThermalStatusChanged(powerManagerStatus: Int): ThermalSeverity {
+        val mapped = mapPowerThermalStatus(powerManagerStatus)
+        synchronized(thermalStateLock) {
+            activeThermalOverride = mapped
+            lastPolledPlatformThermal = readPlatformThermalStatusRaw()
+        }
+        _thermalSeverityFlow.value = mapped
+        publishDeviceCapabilities(readMemoryAndThermalRaw(overrideThermal = mapped))
+        return mapped
     }
 
     suspend fun probeVulkanCapabilities(): VulkanProbeResult = withContext(Dispatchers.IO) {
@@ -253,18 +276,33 @@ class HardwareCapabilityManager(
         if (am != null) {
             am.getMemoryInfo(memInfo)
         }
+        val procTelemetry = processMemorySampler?.invoke(am, memInfo)
+            ?: ProcessMemoryProbe.sample(context = context, activityManager = am, memInfo = memInfo)
+
         val totalMb = (memInfo.totalMem / (1024L * 1024L)).coerceAtLeast(0L)
         val availBytes = memInfo.availMem.coerceAtLeast(0L)
         val availMb = (availBytes / (1024L * 1024L)).coerceAtLeast(0L)
         val thermal = overrideThermal ?: readCurrentThermalStatus()
+        val headroomForecast = readThermalHeadroomForecast()
 
         return LiveDeviceMetrics(
             totalRamMb = totalMb,
             availableRamMb = availMb,
             lowMemory = memInfo.lowMemory,
             thermalSeverity = thermal,
-            availableMemoryBytes = availBytes
+            availableMemoryBytes = availBytes,
+            processMemory = procTelemetry,
+            thermalHeadroomForecast = headroomForecast
         )
+    }
+
+    private fun readThermalHeadroomForecast(): Float? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return null
+        return runCatching {
+            val raw = pm.getThermalHeadroom(10)
+            if (raw.isNaN() || raw.isInfinite() || raw < 0f) null else raw
+        }.getOrNull()
     }
 
     private fun buildDeviceCapabilities(metrics: LiveDeviceMetrics): DeviceCapabilities = synchronized(capabilityLock) {
@@ -285,6 +323,19 @@ class HardwareCapabilityManager(
     }
 
     private fun readCurrentThermalStatus(): ThermalSeverity {
+        val polled = readPlatformThermalStatusRaw()
+        return synchronized(thermalStateLock) {
+            if (polled != lastPolledPlatformThermal) {
+                lastPolledPlatformThermal = polled
+                activeThermalOverride = null
+                polled
+            } else {
+                activeThermalOverride ?: polled
+            }
+        }
+    }
+
+    private fun readPlatformThermalStatusRaw(): ThermalSeverity {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return ThermalSeverity.UNAVAILABLE
         val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return ThermalSeverity.UNAVAILABLE
         val status = runCatching { pm.currentThermalStatus }.getOrNull() ?: return ThermalSeverity.UNAVAILABLE

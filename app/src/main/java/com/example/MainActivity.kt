@@ -1,12 +1,16 @@
 package com.example
 
+import android.Manifest
 import android.content.Intent
 import android.graphics.Color as AndroidColor
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
@@ -37,6 +41,7 @@ import com.example.data.ChatThread
 import com.example.data.LocalRuntimeState
 import com.example.ui.components.AppVersionSheet
 import com.example.ui.components.InferenceSettingsSheet
+import com.example.ui.components.MemoryAdmissionBlockedDialog
 import com.example.ui.components.QuantBottomNav
 import com.example.ui.components.QuantTab
 import com.example.ui.screens.ChatDetailScreen
@@ -100,7 +105,25 @@ fun QuantChatApp(
     val inferenceSettings by viewModel.inferenceSettings.collectAsStateWithLifecycle()
     val isGenerating by viewModel.isGenerating.collectAsStateWithLifecycle()
     val orchestratorSnapshot by viewModel.orchestratorSnapshot.collectAsStateWithLifecycle()
+    val backgroundServicesStatus by viewModel.backgroundServicesStatus.collectAsStateWithLifecycle()
     val pendingExternalNav by viewModel.pendingExternalNavigation.collectAsStateWithLifecycle()
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) {
+        viewModel.refreshNotificationPermission()
+    }
+    var requestedNotificationOnce by remember { mutableStateOf(false) }
+
+    fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !backgroundServicesStatus.notificationsPermissionGranted &&
+            !requestedNotificationOnce
+        ) {
+            requestedNotificationOnce = true
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     val curatedModels by viewModel.curatedModels.collectAsStateWithLifecycle()
     val selectedModelTab by viewModel.selectedModelTab.collectAsStateWithLifecycle()
@@ -112,6 +135,9 @@ fun QuantChatApp(
     val hfAuthState by viewModel.hfAuthState.collectAsStateWithLifecycle()
     val isOnline by viewModel.isOnline.collectAsStateWithLifecycle()
     val isImportingLocalFile by viewModel.isImportingLocalFile.collectAsStateWithLifecycle()
+    val blockedAdmissionPrompt by viewModel.blockedAdmissionPrompt.collectAsStateWithLifecycle()
+    val storageSnapshot by viewModel.storageSnapshot.collectAsStateWithLifecycle()
+    val pendingDeleteConfirmation by viewModel.pendingDeleteConfirmation.collectAsStateWithLifecycle()
 
     val snackbarMessage by viewModel.snackbarMessage.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -228,17 +254,30 @@ fun QuantChatApp(
                         isImportingLocalFile = isImportingLocalFile,
                         npuCapabilities = orchestratorSnapshot.npuCapabilities,
                         npuCompatibilityReport = orchestratorSnapshot.npuCompatibilityReport,
+                        backgroundServicesStatus = backgroundServicesStatus,
+                        storageSnapshot = storageSnapshot,
+                        mmapLifecycle = orchestratorSnapshot.mmapLifecycle,
+                        pendingDeleteConfirmation = pendingDeleteConfirmation,
                         onSelectTab = viewModel::selectModelTab,
                         onSearchQueryChange = viewModel::updateModelSearchQuery,
                         onSearchHubClick = viewModel::searchHuggingFaceHub,
                         onInspectModelFiles = viewModel::inspectModelFiles,
                         onCloseFileInspection = viewModel::closeFileInspection,
-                        onSelectArtifactToDownload = viewModel::startArtifactDownload,
-                        onPauseDownload = viewModel::pauseActiveDownload,
-                        onResumeDownload = viewModel::resumeActiveDownload,
+                        onSelectArtifactToDownload = { model, artifact ->
+                            requestNotificationPermissionIfNeeded()
+                            viewModel.startArtifactDownload(model, artifact)
+                        },
+                        onPauseDownload = { viewModel.pauseActiveDownload() },
+                        onResumeDownload = {
+                            requestNotificationPermissionIfNeeded()
+                            viewModel.resumeActiveDownload()
+                        },
                         onCancelDownload = viewModel::dismissOrCancelDownload,
                         onSwitchDownloadToMirror = viewModel::switchFailedDownloadToOpenMirror,
-                        onLoadLocalModel = viewModel::loadLocalModel,
+                        onLoadLocalModel = { file ->
+                            requestNotificationPermissionIfNeeded()
+                            viewModel.loadLocalModel(file)
+                        },
                         onUnloadLocalModel = viewModel::unloadLocalModel,
                         onOpenChatWithModel = {
                             scope.launch {
@@ -247,8 +286,14 @@ fun QuantChatApp(
                             }
                         },
                         onImportLocalGgufUri = viewModel::importLocalGguf,
-                        onResumeLocalPartial = viewModel::resumeLocalPartialFile,
+                        onResumeLocalPartial = { file ->
+                            requestNotificationPermissionIfNeeded()
+                            viewModel.resumeLocalPartialFile(file)
+                        },
+                        onVerifyLocalFile = viewModel::verifyLocalWeightFile,
                         onDeleteLocalFile = viewModel::deleteLocalFile,
+                        onConfirmUnloadAndDelete = viewModel::confirmUnloadAndDeleteFile,
+                        onDismissDeleteConfirmation = viewModel::dismissDeleteConfirmation,
                         onSaveHfToken = viewModel::saveHfToken
                     )
                 }
@@ -308,6 +353,7 @@ fun QuantChatApp(
         InferenceSettingsSheet(
             currentSettings = inferenceSettings,
             orchestratorSnapshot = orchestratorSnapshot,
+            backgroundServicesStatus = backgroundServicesStatus,
             isModelReady = runtimeState is LocalRuntimeState.Ready,
             onRefreshDiagnostics = viewModel::refreshHardwareDiagnostics,
             onRunBenchmark = viewModel::runHardwareBenchmark,
@@ -315,6 +361,12 @@ fun QuantChatApp(
             onCancelCalibration = viewModel::cancelCalibration,
             onRunVulkanSelfTest = viewModel::runVulkanSelfTest,
             onRunNpuProbe = viewModel::runNpuProbe,
+            onRunMaintenanceNow = viewModel::runMaintenanceNow,
+            onRequestNotificationsPermission = {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            },
             onDismiss = { showSettingsSheet = false },
             onApply = viewModel::updateInferenceSettings,
             onOpenVersionInfo = { showVersionSheet = true }
@@ -324,6 +376,17 @@ fun QuantChatApp(
     if (showVersionSheet) {
         AppVersionSheet(
             onDismiss = { showVersionSheet = false }
+        )
+    }
+
+    blockedAdmissionPrompt?.let { prompt ->
+        MemoryAdmissionBlockedDialog(
+            file = prompt.file,
+            assessment = prompt.assessment,
+            onDismiss = viewModel::dismissBlockedAdmission,
+            onApplyDowngrade = { suggestion ->
+                viewModel.applyDowngradeAndLoad(prompt, suggestion)
+            }
         )
     }
 }

@@ -34,6 +34,7 @@ import com.quantchat.engine.core.AcceleratorPreference
 import com.quantchat.engine.core.BackendRuntimeStatus
 import com.quantchat.engine.core.DeviceCapabilities
 import com.quantchat.engine.core.DeviceCapabilitiesPolicy
+import com.quantchat.engine.core.MmapLifecycleSnapshot
 import java.util.Locale
 
 @Composable
@@ -42,6 +43,7 @@ fun UnifiedCapabilitiesCard(
     backendStatus: BackendRuntimeStatus,
     acceleratorPreference: AcceleratorPreference,
     onRefreshCapabilities: () -> Unit,
+    mmapLifecycle: MmapLifecycleSnapshot? = null,
     modifier: Modifier = Modifier
 ) {
     val thermalLabel = deviceCapabilities?.let { thermalStatusLabel(it.thermalStatus) } ?: "Unknown"
@@ -132,6 +134,18 @@ fun UnifiedCapabilitiesCard(
                 value = "$thermalLabel (${deviceCapabilities.thermalStatus})",
                 valueColor = if (isThermallyThrottled) QuantRose else QuantOnSurfaceVariant
             )
+            if (mmapLifecycle != null) {
+                val mmapText = if (mmapLifecycle.totalActiveMappings > 0) {
+                    "${mmapLifecycle.totalActiveMappings} active lease(s) · FileLock"
+                } else {
+                    "0 active leases (unmapped)"
+                }
+                CapRow(
+                    label = "mmapLifecycle",
+                    value = mmapText,
+                    valueColor = if (mmapLifecycle.totalActiveMappings > 0) QuantEmerald else QuantOnSurfaceVariant
+                )
+            }
 
             // Live Scheduling Linkage Banner
             Column(
